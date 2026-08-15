@@ -25,6 +25,7 @@ from .ui import (
     print_skill_entries,
     print_warning,
 )
+from .runtime_config import RuntimeConfig
 from .session import load_session, get_latest_session_id
 from .memory import list_memories
 from .skills import (
@@ -391,23 +392,34 @@ Examples:
         sys.exit(1)
 
     # 创建主 Agent。OpenAI-compatible 和 Anthropic 原生接口使用不同的 base URL 参数名传入。
-    agent = Agent(
-        permission_mode=permission_mode,
+    runtime_config = RuntimeConfig(
+        provider="openai" if resolved_use_openai else "anthropic",
         model=model,
+        api_key=resolved_api_key,
+        base_url=resolved_api_base,
+        permission_mode=permission_mode,
+        max_cost_usd=args.max_cost,
+        max_turns=args.max_turns,
+        thinking=args.thinking,
+    )
+    agent = Agent(
+        config=runtime_config,
         thinking=args.thinking,
         max_cost_usd=args.max_cost,
         max_turns=args.max_turns,
         api_base=resolved_api_base if resolved_use_openai else None,
         anthropic_base_url=resolved_api_base if not resolved_use_openai else None,
         api_key=resolved_api_key,
+        permission_mode=permission_mode,
+        model=model,
     )
 
     # Resume session
     # --resume 会加载最近一次会话，把历史消息恢复到新建的 Agent 中。
     if args.resume:
-        session_id = get_latest_session_id()
+        session_id = get_latest_session_id(workspace=runtime_config.workspace)
         if session_id:
-            session = load_session(session_id)
+            session = load_session(session_id, workspace=runtime_config.workspace)
             if session:
                 agent.restore_session({
                     "anthropicMessages": session.get("anthropicMessages"),

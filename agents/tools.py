@@ -11,6 +11,7 @@ from pathlib import Path
 from tqdm.utils import IS_WIN
 
 from agents.memory import get_memory_dir
+from agents.policy import PathEscapeError, PolicyEngine
 
 ToolDef = dict  # Anthropic tool schema dict
 #权限模式
@@ -26,17 +27,6 @@ CONCURRENCY_SAFE_TOOLS = {"read_file", "list_files", "grep_search"}
 
 
 
-
-
-
-def get_active_tool_definitions(all_tools: list[ToolDef] | None = None) -> list[ToolDef]:
-    """过滤并返回当前可用的工具定义列表，主要用于 API 调用前剔除尚未激活的“延迟工具”（deferred tools），并删除无关的元数据字段。"""
-    tools = all_tools if all_tools is not None else tool_definitions
-    return [
-        {k: v for k, v in t.items() if k != "deferred"}
-        for t in tools
-        if not t.get("deferred") or t["name"] in _activated_tools
-    ]
 
 
 
@@ -230,7 +220,17 @@ tool_definitions: list[ToolDef] = [
 
 #----------------------工具调用----------------------------
 
+_active_policy: PolicyEngine | None = None
+
+
+def set_active_policy(policy: PolicyEngine | None) -> None:
+    global _active_policy
+    _active_policy = policy
+
+
 def _resolve_tool_path(raw_path: str, *, must_exist: bool = True) -> Path:
+    if _active_policy is not None:
+        return _active_policy.resolve_workspace_path(raw_path, must_exist=must_exist)
     path = Path(raw_path)
     if path.exists() or not path.is_absolute():
         return path
@@ -493,21 +493,25 @@ def get_deferred_tool_names(all_tools: list[ToolDef] | None = None) -> list[str]
 
 #执行shell命令
 def _run_shell(inp: dict) -> str:
+    timeout_ms = inp.get("timeout", 30000)
+    timeout_s = float(timeout_ms) / 1000 if timeout_ms else 30.0
+    if _active_policy is not None:
+        result = _active_policy.run_shell(str(inp.get("command") or ""), timeout_s=timeout_s)
+        return result.format()
     try:
-        timeout_ms = inp.get("timeout", 30000)
-        timeout_s = timeout_ms / 1000
-        result = subprocess.run(
+        completed = subprocess.run(
             inp["command"],
             shell=True,
             capture_output=True,
             text=True,
             timeout=timeout_s,
+            cwd=str(Path.cwd()),
         )
-        output = result.stdout or ""
-        if result.returncode != 0:
-            stderr = f"\nStderr: {result.stderr}" if result.stderr else ""
-            stdout = f"\nStdout: {result.stdout}" if result.stdout else ""
-            return f"Command failed (exit code {result.returncode}){stdout}{stderr}"
+        output = completed.stdout or ""
+        if completed.returncode != 0:
+            stderr = f"\nStderr: {completed.stderr}" if completed.stderr else ""
+            stdout = f"\nStdout: {completed.stdout}" if completed.stdout else ""
+            return f"Command failed (exit code {completed.returncode}){stdout}{stderr}"
         return output or "(no output)"
     except subprocess.TimeoutExpired:
         return f"Command timed out after {inp.get('timeout', 30000)}ms"
@@ -681,6 +685,23 @@ def check_permission(
 # 'agent' 和 'skill' 这两个工具在 agent.py 中处理，以避免循环依赖。"
 
 async def execute_tool(
+    name: str,
+    inp: dict,
+    read_file_state: dict[str, float] | None = None,
+    policy: PolicyEngine | None = None,
+) -> str:
+    previous_policy = _active_policy
+    if policy is not None:
+        set_active_policy(policy)
+    try:
+        return await _execute_tool_inner(name, inp, read_file_state)
+    except PathEscapeError as exc:
+        return f"Action denied: {exc}"
+    finally:
+        set_active_policy(previous_policy)
+
+
+async def _execute_tool_inner(
     name: str, inp: dict, read_file_state: dict[str, float] | None = None
 ) -> str:
     if name == "read_file":

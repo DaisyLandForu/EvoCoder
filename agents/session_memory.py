@@ -158,16 +158,42 @@ def _as_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def parse_folded_memory(text: str) -> dict[str, Any]:
-    parsed = json.loads(_extract_json_text(text))
-    if not isinstance(parsed, dict):
-        raise ValueError("folded memory is not a JSON object")
+REQUIRED_FOLD_KEYS = ("episode_memory", "working_memory", "tool_memory")
 
-    episode = _as_dict(parsed.get("episode_memory"))
-    working = _as_dict(parsed.get("working_memory"))
-    tool = _as_dict(parsed.get("tool_memory"))
 
+class FoldedMemoryError(ValueError):
+    """Raised when compacted session memory cannot be trusted."""
+
+
+def empty_folded_memory() -> dict[str, Any]:
     return {
+        "episode_memory": {
+            "task_description": "",
+            "key_events": [],
+            "current_progress": "",
+        },
+        "working_memory": {
+            "immediate_goal": "",
+            "current_challenges": "",
+            "next_actions": [],
+        },
+        "tool_memory": {
+            "tools_used": [],
+            "derived_rules": [],
+        },
+    }
+
+
+def validate_folded_memory(memory: dict[str, Any] | None) -> dict[str, Any]:
+    """Validate and fill the three-layer fold schema. Corrupt data is not passed through."""
+    if not isinstance(memory, dict):
+        raise FoldedMemoryError("folded memory is not an object")
+    if not any(memory.get(key) for key in REQUIRED_FOLD_KEYS):
+        raise FoldedMemoryError("folded memory is missing required layers")
+    episode = _as_dict(memory.get("episode_memory"))
+    working = _as_dict(memory.get("working_memory"))
+    tool = _as_dict(memory.get("tool_memory"))
+    validated = {
         "episode_memory": {
             "task_description": str(episode.get("task_description") or ""),
             "key_events": _as_list(episode.get("key_events")),
@@ -183,6 +209,17 @@ def parse_folded_memory(text: str) -> dict[str, Any]:
             "derived_rules": _as_list(tool.get("derived_rules")),
         },
     }
+    if not validated["episode_memory"]["task_description"] and not validated["working_memory"]["immediate_goal"]:
+        raise FoldedMemoryError("folded memory has no recoverable task state")
+    return validated
+
+
+def parse_folded_memory(text: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(_extract_json_text(text))
+    except Exception as exc:
+        raise FoldedMemoryError("folded memory JSON is invalid") from exc
+    return validate_folded_memory(parsed)
 
 
 def fallback_folded_memory(transcript: str) -> dict[str, Any]:
@@ -199,6 +236,21 @@ def fallback_folded_memory(transcript: str) -> dict[str, Any]:
         },
         "tool_memory": {"tools_used": [], "derived_rules": []},
     }
+
+
+def load_folded_memory_or_fallback(value: Any, *, transcript: str = "") -> dict[str, Any]:
+    """Deserialize fold state, falling back instead of injecting corrupt JSON."""
+    if isinstance(value, str):
+        try:
+            return parse_folded_memory(value)
+        except FoldedMemoryError:
+            return fallback_folded_memory(transcript or value)
+    if isinstance(value, dict):
+        try:
+            return validate_folded_memory(value)
+        except FoldedMemoryError:
+            return fallback_folded_memory(transcript or json.dumps(value, ensure_ascii=False))
+    return fallback_folded_memory(transcript)
 
 
 def format_folded_memory(memory: dict[str, Any]) -> str:

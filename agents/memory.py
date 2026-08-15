@@ -12,16 +12,14 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-from .frontmatter import parse_frontmatter, format_frontmatter
-from typing import Callable
+from .frontmatter import format_frontmatter, parse_frontmatter
 # side query 是一个异步函数：输入 system prompt 和 user prompt，返回模型文本。
 # 这里标成 Any 是为了避免在运行时引入复杂 Awaitable 类型约束。
 SideQueryFn = Callable[[str, str], Any]  # actually Awaitable[str]
@@ -47,14 +45,16 @@ class MemoryEntry:
 
 
 
-def _project_hash() -> str:
-    """用当前工作目录生成稳定 hash，让不同项目的记忆互相隔离。"""
-    return hashlib.sha256(str(Path.cwd()).encode()).hexdigest()[:16]
+def _project_hash(workspace: str | Path | None = None) -> str:
+    """用规范化后的工作目录生成稳定 hash，让不同项目的记忆互相隔离。"""
+    from .runtime_config import workspace_id
+
+    return workspace_id(workspace)
 
 
-def get_memory_dir() -> Path:
+def get_memory_dir(workspace: str | Path | None = None) -> Path:
     """返回当前项目的 memory 目录，不存在时自动创建。"""
-    d = Path.home() / ".BearCode" / "projects" / _project_hash() / "memory"
+    d = Path.home() / ".BearCode" / "projects" / _project_hash(workspace) / "memory"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -349,6 +349,18 @@ class MemoryPrefetch:
         return self.task.done()
 
 
+def _should_prefetch_memory(query: str) -> bool:
+    """Trigger recall for multi-word, CJK, or reasonably long queries."""
+    text = str(query or "").strip()
+    if not text:
+        return False
+    if re.search(r"\s", text):
+        return True
+    if re.search(r"[\u4e00-\u9fff]", text):
+        return True
+    return len(text) >= 8
+
+
 def start_memory_prefetch(
     query: str,
     side_query: SideQueryFn,
@@ -362,8 +374,8 @@ def start_memory_prefetch(
     Agent 主循环后续会检查任务是否完成，完成后再把 memory 注入当前消息。
     """
 
-    # 只有多词输入才触发 memory 预取，避免每个短命令都消耗一次 side query。
-    if not re.search(r"\s", query.strip()):
+    # 空白分隔、纯中文或足够长的查询都可以触发 memory 预取。
+    if not _should_prefetch_memory(query):
         return None
 
     # 当前 session 的 memory 使用量不能超过预算。
