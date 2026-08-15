@@ -116,5 +116,5 @@ docker run --rm --name evocoder-p0-test --network=bridge \
 ## 7. Git 信息
 
 - 阶段开始 Commit：`cacc4e89d3a52eece5a947439fb8371652f274ba`
-- 阶段结束 Commit：见提交后输出的 SHA
+- 阶段结束 Commit：`4b4d7b4b8e7ac7d835216a88883dc970863b24a4`
 - 未纳入本 Commit 的已有工作区改动：`docs/feishuDownload/*`、`docs/localHistory/*` 删除，以及未跟踪的 `wiki/docs/`
