@@ -333,10 +333,13 @@ class Agent:
             model = self.model
             async def _sq(system:str, user_message:str)->str:
 
-                resp = await client.messages.create(
-                    model=model, max_tokens=max(1, int(max_tokens)), system=system,
-                messages=[{"role": "user", "content": user_message}],
-                )
+                async def _call():
+                    return await client.messages.create(
+                        model=model, max_tokens=max(1, int(max_tokens)), system=system,
+                        messages=[{"role": "user", "content": user_message}],
+                    )
+
+                resp = await self._call_model_with_timeout(_call)
                 text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
                 if not text.strip():
                     block_types = [str(getattr(b, "type", "")) for b in getattr(resp, "content", [])]
@@ -352,15 +355,17 @@ class Agent:
             client = self._openai_client
             model = self.model
             async def _sq_openai(system:str, user_message:str)->str:
-                resp = await client.chat.completions.create(
-                    model=model,
-                    max_tokens=max(1, int(max_tokens)),
-                    messages=[
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user_message},
-                    ],
+                async def _call():
+                    return await client.chat.completions.create(
+                        model=model,
+                        max_tokens=max(1, int(max_tokens)),
+                        messages=[
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": user_message},
+                        ],
+                    )
 
-                )
+                resp = await self._call_model_with_timeout(_call)
                 if not resp.choices:
                     logging.warning("side_query returned no OpenAI-compatible choices: model=%s", model)
                     return ""

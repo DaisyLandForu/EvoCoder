@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Mapping, Protocol
 
-from .runtime_config import normalize_workspace
+from .runtime_config import normalize_workspace, workspace_id
 
 PolicyAction = Literal["allow", "deny", "confirm"]
 
@@ -20,7 +20,7 @@ SIDE_EFFECT_TOOLS = WRITE_TOOLS | frozenset({"run_shell", "agent", "skill"})
 CONCURRENCY_SAFE_TOOLS = frozenset({"read_file", "list_files", "grep_search"})
 CONTROL_TOOLS = frozenset({"enter_plan_mode", "exit_plan_mode", "tool_search", "compact_context"})
 
-MCP_TRUST_FILENAME = "mcp.trusted"
+MCP_TRUST_DIRNAME = "mcp-trust"
 MCP_TRUST_ENV = "BEAR_MCP_TRUSTED"
 
 #: Repository-level MCP configuration files. All of them are covered by the trust hash,
@@ -181,6 +181,14 @@ def mcp_config_hash(workspace: Path) -> str:
     return digest.hexdigest()
 
 
+def mcp_trust_record_path(workspace: Path) -> Path:
+    """Trust lives in the user's home, never inside the repository being trusted.
+
+    A record committed to the repository would otherwise arrive pre-trusted after a clone.
+    """
+    return Path.home() / ".bear" / MCP_TRUST_DIRNAME / f"{workspace_id(workspace)}.json"
+
+
 def is_mcp_config_trusted(workspace: Path) -> bool:
     """Repository-level MCP config must be explicitly trusted before servers are started."""
     raw = os.environ.get(MCP_TRUST_ENV, "").strip().lower()
@@ -189,21 +197,31 @@ def is_mcp_config_trusted(workspace: Path) -> bool:
     workspace = normalize_workspace(workspace)
     if not repo_mcp_declarations(workspace):
         return True
-    trust_path = workspace / ".bear" / MCP_TRUST_FILENAME
-    if not trust_path.is_file():
+    record = _load_settings(mcp_trust_record_path(workspace))
+    if not isinstance(record, dict):
         return False
-    try:
-        recorded = trust_path.read_text(encoding="utf-8").strip()
-    except OSError:
+    if str(record.get("workspace") or "") != str(workspace):
         return False
-    return recorded == mcp_config_hash(workspace)
+    return str(record.get("configHash") or "") == mcp_config_hash(workspace)
 
 
 def write_mcp_trust(workspace: Path) -> Path:
+    """Record an explicit user decision to trust this repository's MCP declarations."""
     workspace = normalize_workspace(workspace)
-    trust_path = workspace / ".bear" / MCP_TRUST_FILENAME
+    trust_path = mcp_trust_record_path(workspace)
     trust_path.parent.mkdir(parents=True, exist_ok=True)
-    trust_path.write_text(mcp_config_hash(workspace) + "\n", encoding="utf-8")
+    trust_path.write_text(
+        json.dumps(
+            {
+                "workspace": str(workspace),
+                "workspaceId": workspace_id(workspace),
+                "configHash": mcp_config_hash(workspace),
+                "files": [str(path.relative_to(workspace)) for path in repo_mcp_declarations(workspace)],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     return trust_path
 
 
@@ -369,9 +387,6 @@ class PolicyEngine:
         if path_decision.action == "deny":
             return path_decision
 
-        if self.permission_mode == "bypassPermissions":
-            return PolicyDecision(action="allow", reason="bypass")
-
         rule = self._rule_decision(tool_name, inp)
         if rule == "deny":
             return PolicyDecision(
@@ -379,19 +394,25 @@ class PolicyEngine:
                 message=f"Denied by permission rule for {tool_name}",
                 reason="rule_deny",
             )
-        if rule == "allow":
-            return PolicyDecision(action="allow", reason="rule_allow")
 
-        if tool_name.startswith("mcp__"):
-            return self._authorize_mcp(tool_name)
-
-        if tool_name in READ_TOOLS:
-            return PolicyDecision(action="allow", reason="read_tool")
-
+        # Plan mode and MCP trust are hard boundaries: a project `allow` rule may only
+        # remove confirmation prompts in the normal modes, never lift these limits.
         if self.permission_mode == "plan":
             plan_decision = self._authorize_plan_mode(tool_name, inp)
             if plan_decision is not None:
                 return plan_decision
+
+        if tool_name.startswith("mcp__"):
+            return self._authorize_mcp(tool_name)
+
+        if rule == "allow":
+            return PolicyDecision(action="allow", reason="rule_allow")
+
+        if self.permission_mode == "bypassPermissions":
+            return PolicyDecision(action="allow", reason="bypass")
+
+        if tool_name in READ_TOOLS:
+            return PolicyDecision(action="allow", reason="read_tool")
 
         if tool_name in CONTROL_TOOLS:
             return PolicyDecision(action="allow", reason="control_tool")
@@ -410,6 +431,14 @@ class PolicyEngine:
         return PolicyDecision(action="confirm", message=message, reason="needs_confirmation")
 
     def _authorize_plan_mode(self, tool_name: str, inp: dict[str, Any]) -> PolicyDecision | None:
+        if tool_name in READ_TOOLS:
+            return None
+        if tool_name.startswith("mcp__"):
+            return PolicyDecision(
+                action="deny",
+                message=f"Blocked in plan mode: unknown MCP tool {tool_name} is treated as side-effecting",
+                reason="plan_mcp_side_effect",
+            )
         if tool_name in WRITE_TOOLS:
             raw_path = str(inp.get("file_path") or inp.get("path") or "")
             if raw_path and self._is_plan_file(Path(raw_path).expanduser().resolve()):
@@ -469,14 +498,8 @@ class PolicyEngine:
         if not self.mcp_trusted and not is_mcp_config_trusted(self.workspace):
             return PolicyDecision(
                 action="deny",
-                message="Project .mcp.json is not trusted. Trust it before starting MCP servers.",
+                message="Repository MCP config is not trusted. Trust it before starting MCP servers.",
                 reason="mcp_untrusted",
-            )
-        if self.permission_mode == "plan":
-            return PolicyDecision(
-                action="deny",
-                message=f"Blocked in plan mode: unknown MCP tool {tool_name} is treated as side-effecting",
-                reason="plan_mcp_side_effect",
             )
         return PolicyDecision(action="allow", reason="mcp_allow")
 

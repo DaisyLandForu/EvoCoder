@@ -177,8 +177,45 @@ docker run --rm --network=bridge --security-opt no-new-privileges \
 | 7 | `test_resume_restores_folded_memory_and_session_identity` |
 | 全局 | `tests/conftest.py` 增加 autouse 的 `isolated_home`，测试不再读写真实 `~/.bear` 与 `~/.bear-code` |
 
-### 8.3 仍未处理
+### 8.3 第三轮返工：策略优先级、信任位置与超时传播
+
+第二轮审查判定“有条件通过”（约 86/100），剩 1 个权限阻断项和 2 个实现不完整项。本轮为收尾小修。
+
+| # | 问题 | 根因 | 修复方式 | 对应文件 |
+|---|------|------|----------|----------|
+| 8 | 项目 `allow` 规则可绕过 Plan Mode：配置 `{"permissions":{"allow":["write_file"]}}` 后 Plan 模式对普通代码文件返回 `allow / rule_allow` | `authorize()` 先处理 `rule_allow`，再检查 Plan Mode | 重排为：父策略/路径 → deny 规则 → Plan Mode 硬限制 → MCP 信任 → allow 规则 → 权限模式。Plan 下的 MCP 判定并入 `_authorize_plan_mode()`，`_authorize_mcp()` 只负责信任 | `agents/policy.py` |
+| 9 | MCP 信任凭证放在仓库内 `.bear/mcp.trusted`，仓库预置一个匹配哈希的文件即可让克隆方“已信任” | 信任状态存在被信任对象自己身上 | 信任记录移到用户目录 `~/.bear/mcp-trust/<workspace_id>.json`，并记录 workspace 绝对路径、配置哈希与被信任文件列表；路径不匹配或哈希不匹配都视为未信任 | `agents/policy.py`、`.gitignore` |
+| 10 | 超时只接到主模型流：Side Query 不受 `model_timeout_s` 约束，Shell 恒用 30s 而非 `tool_timeout_s` | `_build_side_query()` 直接调用客户端；`_run_shell()` 把缺省值写死成 30000ms | Side Query 的两个 provider 分支都经过 `_call_model_with_timeout()`；`run_shell` 未显式传 `timeout` 时传 `None`，由 `PolicyEngine` 回落到 `RuntimeConfig.tool_timeout_s` | `agents/agent.py`、`agents/tools.py` |
+
+顺带收敛的一处语义：deny 规则现在位于 `bypassPermissions` 之前，`--yolo` 也无法越过用户自己写的 deny 规则。
+
+新的策略判定顺序：
+
+```text
+父 Agent 策略
+→ Workspace 路径边界
+→ 项目 deny 规则
+→ Plan Mode 硬限制
+→ MCP 仓库信任
+→ 项目 allow 规则
+→ bypassPermissions
+→ 只读 / 控制类工具
+→ 当前权限模式的确认矩阵
+```
+
+第三轮测试：**103 passed / 0 failed**（第二轮 87）。新增用例：
+
+| 缺陷 | 测试 |
+|------|------|
+| 8 | `test_project_allow_rule_cannot_bypass_plan_mode`（write_file/edit_file/run_shell/agent 四种参数化）、`test_project_allow_rule_cannot_bypass_mcp_trust`、`test_project_allow_rule_cannot_bypass_workspace_boundary`、`test_project_allow_rule_still_skips_confirmation_in_normal_mode`、`test_deny_rule_applies_even_under_bypass` |
+| 9 | `test_trust_record_is_stored_in_the_user_home`、`test_repo_committed_trust_file_does_not_grant_trust`、`test_trust_does_not_transfer_to_a_clone_at_another_path` |
+| 10 | `tests/integration/test_timeout_propagation.py` 全部 5 例（Anthropic/OpenAI Side Query 超时、Shell 缺省用 `tool_timeout_s`、显式 `timeout` 优先、子 Agent 继承超时） |
+
+Ruff：P0 新增模块与 `tests/` 全部通过；全库历史告警仍为 141 条。CLI Smoke 通过。
+
+### 8.4 仍未处理
 
 - 第 6 节列出的风险项保持不变（容器化 Shell 后端、MCP Streamable HTTP、历史 Ruff 告警、未跑真实模型）。
 - Plan 模式下对同一计划文件的第二次写入仍受“先读后写”保护约束，需要模型先 `read_file`。这是既有行为，本轮未改。
+- 尚无交互式的 MCP 信任确认入口，当前依赖 `write_mcp_trust()` 或 `BEAR_MCP_TRUSTED=1`。
 - P1 未开始。

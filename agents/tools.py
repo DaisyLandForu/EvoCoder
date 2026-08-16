@@ -493,11 +493,13 @@ def get_deferred_tool_names(all_tools: list[ToolDef] | None = None) -> list[str]
 
 #执行shell命令
 def _run_shell(inp: dict) -> str:
-    timeout_ms = inp.get("timeout", 30000)
-    timeout_s = float(timeout_ms) / 1000 if timeout_ms else 30.0
+    # No explicit timeout means "use the runtime budget", not a hardcoded default.
+    timeout_ms = inp.get("timeout")
+    timeout_s = float(timeout_ms) / 1000 if timeout_ms else None
     if _active_policy is not None:
         result = _active_policy.run_shell(str(inp.get("command") or ""), timeout_s=timeout_s)
         return result.format()
+    timeout_s = timeout_s or 30.0
     try:
         completed = subprocess.run(
             inp["command"],

@@ -197,7 +197,6 @@ cython_debug/
 .teams/
 .bear/skill-evolution/
 .bear/sessions/
-.bear/mcp.trusted
 .pytest_cache/
 
 # Ruff stuff:

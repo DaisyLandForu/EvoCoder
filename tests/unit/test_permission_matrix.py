@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -103,6 +104,64 @@ def test_default_mode_asks_before_every_edit(workspace: Path) -> None:
         "write_file", {"file_path": str(workspace / "src" / "app.py"), "content": "x"}
     )
     assert decision.action == "confirm"
+
+
+def _write_rules(workspace: Path, permissions: dict) -> None:
+    settings = workspace / ".bear" / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps({"permissions": permissions}), encoding="utf-8")
+    reset_permission_cache()
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        ("write_file", {"file_path": "src/app.py", "content": "x"}),
+        ("edit_file", {"file_path": "src/app.py", "old_string": "a", "new_string": "b"}),
+        ("run_shell", {"command": "ls"}),
+        ("agent", {"type": "general", "prompt": "do it"}),
+    ],
+)
+def test_project_allow_rule_cannot_bypass_plan_mode(workspace: Path, tool: str, arguments: dict) -> None:
+    """Plan mode is a hard boundary; project rules may only relax the normal modes."""
+    _write_rules(workspace, {"allow": ["write_file", "edit_file", "run_shell", "agent"]})
+    arguments = dict(arguments)
+    if "file_path" in arguments:
+        arguments["file_path"] = str(workspace / arguments["file_path"])
+    decision = _engine(workspace, "plan").authorize(tool, arguments)
+    assert decision.action == "deny"
+    assert decision.reason.startswith("plan_")
+
+
+def test_project_allow_rule_cannot_bypass_mcp_trust(workspace: Path) -> None:
+    (workspace / ".mcp.json").write_text('{"mcpServers": {"x": {"command": "true"}}}', encoding="utf-8")
+    _write_rules(workspace, {"allow": ["mcp__x__echo"]})
+    decision = PolicyEngine(workspace=workspace, permission_mode="default").authorize("mcp__x__echo", {})
+    assert decision.action == "deny"
+    assert decision.reason == "mcp_untrusted"
+
+
+def test_project_allow_rule_still_skips_confirmation_in_normal_mode(workspace: Path) -> None:
+    _write_rules(workspace, {"allow": ["write_file"]})
+    decision = _engine(workspace, "default").authorize(
+        "write_file", {"file_path": str(workspace / "src" / "app.py"), "content": "x"}
+    )
+    assert decision.action == "allow"
+    assert decision.reason == "rule_allow"
+
+
+def test_project_allow_rule_cannot_bypass_workspace_boundary(workspace: Path) -> None:
+    _write_rules(workspace, {"allow": ["read_file"]})
+    decision = _engine(workspace, "default").authorize("read_file", {"file_path": "/etc/passwd"})
+    assert decision.action == "deny"
+    assert decision.reason == "path_escape"
+
+
+def test_deny_rule_applies_even_under_bypass(workspace: Path) -> None:
+    _write_rules(workspace, {"deny": ["run_shell(rm*)"]})
+    decision = _engine(workspace, "bypassPermissions").authorize("run_shell", {"command": "rm -rf /"})
+    assert decision.action == "deny"
+    assert decision.reason == "rule_deny"
 
 
 def test_settings_deny_rule_wins_over_mode(workspace: Path) -> None:

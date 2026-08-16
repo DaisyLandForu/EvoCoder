@@ -10,6 +10,7 @@ from agents.policy import (
     PolicyEngine,
     is_mcp_config_trusted,
     mcp_config_hash,
+    mcp_trust_record_path,
     write_mcp_trust,
 )
 
@@ -51,3 +52,33 @@ def test_settings_without_servers_does_not_require_trust(workspace: Path) -> Non
     _write(workspace / ".bear" / "settings.json", {"permissions": {"allow": ["read_file"]}})
     assert is_mcp_config_trusted(workspace) is True
     assert mcp_config_hash(workspace) == ""
+
+
+def test_trust_record_is_stored_in_the_user_home(workspace: Path, isolated_home: Path) -> None:
+    _write(workspace / ".mcp.json", SERVER)
+    record = write_mcp_trust(workspace)
+    assert record == mcp_trust_record_path(workspace)
+    assert isolated_home in record.parents
+    assert workspace not in record.parents
+    assert is_mcp_config_trusted(workspace) is True
+
+
+def test_repo_committed_trust_file_does_not_grant_trust(workspace: Path) -> None:
+    """A cloned repository cannot ship its own approval."""
+    _write(workspace / ".mcp.json", SERVER)
+    committed = workspace / ".bear" / "mcp.trusted"
+    committed.parent.mkdir(parents=True, exist_ok=True)
+    committed.write_text(mcp_config_hash(workspace) + "\n", encoding="utf-8")
+
+    assert is_mcp_config_trusted(workspace) is False
+    assert McpManager(workspace=workspace, trusted=False)._load_configs() == {}
+
+
+def test_trust_does_not_transfer_to_a_clone_at_another_path(workspace: Path, tmp_path: Path) -> None:
+    _write(workspace / ".mcp.json", SERVER)
+    write_mcp_trust(workspace)
+
+    clone = tmp_path.parent / f"{tmp_path.name}-clone"
+    clone.mkdir(exist_ok=True)
+    _write(clone / ".mcp.json", SERVER)
+    assert is_mcp_config_trusted(clone) is False
