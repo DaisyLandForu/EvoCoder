@@ -19,7 +19,7 @@ from agents.memory import MemoryPrefetch, start_memory_prefetch, format_memories
 from agents.plan_mode import PlanModeController, PlanPhase
 from agents.policy import CONCURRENCY_SAFE_TOOLS as POLICY_SAFE_TOOLS, PolicyDecision, PolicyEngine
 from agents.prompt import build_system_prompt
-from agents.runtime_config import RuntimeConfig, clamp_permission
+from agents.runtime_config import RuntimeConfig
 from agents.session_memory import (
     FOLD_SESSION_MEMORY_SYSTEM,
     build_anthropic_transcript,
@@ -28,12 +28,11 @@ from agents.session_memory import (
     fallback_folded_memory,
     format_folded_memory,
     load_folded_memory_or_fallback,
-    parse_folded_memory,
 )
 from agents.session import save_folded_session_memory, save_session
 from agents.subagent import get_sub_agent_config
 from agents.tool_scheduler import NormalizedToolCall, ScheduledToolResult, ToolCallScheduler
-from agents.tools import ToolDef, tool_definitions, execute_tool, CONCURRENCY_SAFE_TOOLS, check_permission, \
+from agents.tools import ToolDef, tool_definitions, execute_tool, CONCURRENCY_SAFE_TOOLS, \
     get_active_tool_definitions
 from agents.ui import print_info, print_divider, print_assistant_text, print_sub_agent_start, print_sub_agent_end, \
     start_spinner, stop_spinner, print_cost, print_tool_call, print_tool_result, print_confirmation, print_retry, \
@@ -397,8 +396,12 @@ class Agent:
         self._refresh_runtime_system_prompt()
 
     def _sync_system_prompt_messages(self) -> None:
-        if self.use_openai and self._openai_messages:
+        if not self.use_openai:
+            return
+        if self._openai_messages and self._openai_messages[0].get("role") == "system":
             self._openai_messages[0]["content"] = self._system_prompt
+        else:
+            self._openai_messages.insert(0, {"role": "system", "content": self._system_prompt})
 
     def _child_runtime(self, *, agent_type: str = "general", readonly: bool | None = None):
         child_config = self.config.derive_child(agent_type=agent_type, readonly=readonly)
@@ -807,12 +810,23 @@ class Agent:
             self._anthropic_messages = self._normalize_anthropic_messages(_sanitize_for_utf8(data["anthropicMessages"]))
         if data.get("openaiMessages"):
             self._openai_messages = _sanitize_for_utf8(data["openaiMessages"])
+            self._sync_system_prompt_messages()
         if isinstance(data.get("foldedSessionMemories"), list):
             restored = []
             for item in data["foldedSessionMemories"]:
                 restored.append(load_folded_memory_or_fallback(_sanitize_for_utf8(item)))
             self._folded_session_memories = restored
-        print_info(f"Session restored ({self._get_message_count()} messages).")
+        metadata = data.get("metadata")
+        if isinstance(metadata, dict):
+            # Keep writing to the same session file so a resumed run stays one long task.
+            if metadata.get("id"):
+                self.session_id = str(metadata["id"])
+            if metadata.get("startTime"):
+                self.session_start_time = str(metadata["startTime"])
+        print_info(
+            f"Session restored ({self._get_message_count()} messages, "
+            f"{len(self._folded_session_memories)} folded memories)."
+        )
 
 
 
@@ -1486,6 +1500,16 @@ class Agent:
         # Fallback
         return {"type": _safe_utf8_text(block.type)}
 
+    async def _call_model_with_timeout(self, do: Callable[[], Awaitable[Any]]) -> Any:
+        """Apply the RuntimeConfig model timeout to a single model call attempt."""
+        timeout = float(getattr(self.config, "model_timeout_s", 0.0) or 0.0)
+        if timeout <= 0:
+            return await do()
+        try:
+            return await asyncio.wait_for(do(), timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(f"Model call timed out after {timeout:g}s") from exc
+
     async def _call_anthropic_stream(self, on_tool_block_complete=None):
 
         async def _do():
@@ -1568,7 +1592,7 @@ class Agent:
             final_message.content = [b for b in final_message.content if b.type != "thinking"]
             return final_message
 #调用 _do()，如果遇到可重试错误，就由 _with_retry() 负责重试。
-        return await _with_retry(_do)
+        return await _with_retry(lambda: self._call_model_with_timeout(_do))
 
     #openAI后端
 
@@ -1644,6 +1668,14 @@ class Agent:
             budget = self._check_budget()
             if budget["exceeded"]:
                 print_info(f"Budget exceeded: {budget['reason']}")
+                # Every requested tool_call_id still needs a result, otherwise the next
+                # request would start from an assistant(tool_calls) message with no reply.
+                for call in self._scheduler.normalize_openai(tool_calls):
+                    self._openai_messages.append({
+                        "role": "tool",
+                        "tool_call_id": call.tool_call_id,
+                        "content": f"Tool execution skipped: {budget['reason']}",
+                    })
                 break
 
             calls = self._scheduler.normalize_openai(tool_calls)
@@ -1722,7 +1754,7 @@ class Agent:
                 "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0},
             }
 
-        return await _with_retry(_do)
+        return await _with_retry(lambda: self._call_model_with_timeout(_do))
 
     async def _confirm_dangerous(self, command: str) -> bool:
         print_confirmation(command)

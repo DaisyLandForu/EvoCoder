@@ -10,6 +10,19 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
+@pytest.fixture(autouse=True)
+def isolated_home(tmp_path_factory, monkeypatch):
+    """Keep tests away from the real ~/.bear and ~/.bear-code state."""
+    home = tmp_path_factory.mktemp("home")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("BEAR_MCP_TRUSTED", raising=False)
+    from agents.policy import reset_permission_cache
+
+    reset_permission_cache()
+    yield home
+    reset_permission_cache()
+
+
 @pytest.fixture
 def workspace(tmp_path: Path) -> Path:
     (tmp_path / "src").mkdir()

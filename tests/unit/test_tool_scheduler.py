@@ -117,6 +117,73 @@ async def test_openai_and_anthropic_share_scheduler() -> None:
 
 
 @pytest.mark.asyncio
+async def test_read_after_write_is_not_hoisted_before_the_write() -> None:
+    state = {"file": "old"}
+    executed: list[str] = []
+
+    async def execute(call: NormalizedToolCall) -> str:
+        executed.append(call.name)
+        if call.name == "write_file":
+            state["file"] = call.arguments["content"]
+            return "written"
+        return state["file"]
+
+    scheduler = ToolCallScheduler()
+    calls = [
+        NormalizedToolCall("w", "write_file", {"file_path": "f", "content": "new"}, 0),
+        NormalizedToolCall("r", "read_file", {"file_path": "f"}, 1),
+    ]
+    results = await scheduler.run_round(calls, authorize=_allow, execute=execute)
+    assert executed == ["write_file", "read_file"]
+    assert results[1].content == "new"
+
+
+@pytest.mark.asyncio
+async def test_read_segments_around_a_write_run_in_order() -> None:
+    executed: list[str] = []
+
+    async def execute(call: NormalizedToolCall) -> str:
+        executed.append(call.tool_call_id)
+        return call.tool_call_id
+
+    scheduler = ToolCallScheduler()
+    calls = [
+        NormalizedToolCall("r1", "read_file", {"file_path": "a"}, 0),
+        NormalizedToolCall("r2", "grep_search", {"pattern": "x"}, 1),
+        NormalizedToolCall("w1", "write_file", {"file_path": "a", "content": "1"}, 2),
+        NormalizedToolCall("r3", "read_file", {"file_path": "a"}, 3),
+    ]
+    results = await scheduler.run_round(calls, authorize=_allow, execute=execute)
+    assert executed.index("w1") > executed.index("r1")
+    assert executed.index("w1") > executed.index("r2")
+    assert executed.index("r3") > executed.index("w1")
+    assert [item.tool_call_id for item in results] == ["r1", "r2", "w1", "r3"]
+
+
+@pytest.mark.asyncio
+async def test_consecutive_read_only_calls_still_run_concurrently() -> None:
+    running = 0
+    peak = 0
+
+    async def execute(_call: NormalizedToolCall) -> str:
+        nonlocal running, peak
+        running += 1
+        peak = max(peak, running)
+        await asyncio.sleep(0.02)
+        running -= 1
+        return "ok"
+
+    scheduler = ToolCallScheduler()
+    calls = [
+        NormalizedToolCall("r1", "read_file", {"file_path": "a"}, 0),
+        NormalizedToolCall("r2", "read_file", {"file_path": "b"}, 1),
+        NormalizedToolCall("r3", "list_files", {"pattern": "*"}, 2),
+    ]
+    await scheduler.run_round(calls, authorize=_allow, execute=execute)
+    assert peak == 3
+
+
+@pytest.mark.asyncio
 async def test_write_tools_are_not_unconstrained_concurrent() -> None:
     current = 0
     max_current = 0

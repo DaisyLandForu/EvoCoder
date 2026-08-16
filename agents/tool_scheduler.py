@@ -164,31 +164,22 @@ class ToolCallScheduler:
                     continue
             executable.append(call)
 
-        concurrent = [call for call in executable if call.name in self.concurrency_safe]
-        serial = [call for call in executable if call.name not in self.concurrency_safe]
-
-        if concurrent:
-            gathered = await asyncio.gather(
-                *[self._run_one(call, execute) for call in concurrent],
-                return_exceptions=True,
-            )
-            for call, item in zip(concurrent, gathered):
-                results[call.tool_call_id] = self._coerce_result(call, item)
-
         context_break = False
-        for call in serial:
+        for segment in self._segment(executable):
             if context_break:
-                results[call.tool_call_id] = ScheduledToolResult(
-                    tool_call_id=call.tool_call_id,
-                    name=call.name,
-                    status="skipped",
-                    content="Tool execution skipped because the conversation context was reset.",
-                    error_type="context_cleared",
-                    source_index=call.source_index,
-                )
+                for call in segment:
+                    results[call.tool_call_id] = self._context_break_result(call)
                 continue
-            item = await self._run_one(call, execute)
-            result = self._coerce_result(call, item)
+            if len(segment) > 1:
+                gathered = await asyncio.gather(
+                    *[self._run_one(call, execute) for call in segment],
+                    return_exceptions=True,
+                )
+                for call, item in zip(segment, gathered):
+                    results[call.tool_call_id] = self._coerce_result(call, item)
+                continue
+            call = segment[0]
+            result = self._coerce_result(call, await self._run_one(call, execute))
             results[call.tool_call_id] = result
             if result.error_type == "context_cleared":
                 context_break = True
@@ -232,6 +223,37 @@ class ToolCallScheduler:
             ordered.append(copy)
         ordered.sort(key=lambda item: item.source_index)
         return ordered
+
+    def _segment(self, calls: list[NormalizedToolCall]) -> list[list[NormalizedToolCall]]:
+        """Group consecutive read-only calls; every side-effecting call is its own barrier.
+
+        Reads must never be hoisted across a write, otherwise a `write_file` followed by
+        `read_file` would report the pre-write content.
+        """
+        segments: list[list[NormalizedToolCall]] = []
+        batch: list[NormalizedToolCall] = []
+        for call in calls:
+            if call.name in self.concurrency_safe:
+                batch.append(call)
+                continue
+            if batch:
+                segments.append(batch)
+                batch = []
+            segments.append([call])
+        if batch:
+            segments.append(batch)
+        return segments
+
+    @staticmethod
+    def _context_break_result(call: NormalizedToolCall) -> ScheduledToolResult:
+        return ScheduledToolResult(
+            tool_call_id=call.tool_call_id,
+            name=call.name,
+            status="skipped",
+            content="Tool execution skipped because the conversation context was reset.",
+            error_type="context_cleared",
+            source_index=call.source_index,
+        )
 
     async def _run_one(self, call: NormalizedToolCall, execute: ExecuteFn) -> ScheduledToolResult:
         try:

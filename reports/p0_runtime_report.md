@@ -116,5 +116,69 @@ docker run --rm --name evocoder-p0-test --network=bridge \
 ## 7. Git 信息
 
 - 阶段开始 Commit：`cacc4e89d3a52eece5a947439fb8371652f274ba`
-- 阶段结束 Commit：`4b4d7b4b8e7ac7d835216a88883dc970863b24a4`
+- 第一轮实现 Commit：`4b4d7b4b8e7ac7d835216a88883dc970863b24a4`
 - 未纳入本 Commit 的已有工作区改动：`docs/feishuDownload/*`、`docs/localHistory/*` 删除，以及未跟踪的 `wiki/docs/`
+
+## 8. 第二轮返工：外部审查缺陷修复
+
+外部审查在 `4b4d7b4` 上判定 P0 暂不通过，列出 5 个阻断缺陷和 2 个次要缺口。本节记录逐项修复。
+
+### 8.1 修复项
+
+| # | 审查发现的问题 | 根因 | 修复方式 | 对应文件 |
+|---|----------------|------|----------|----------|
+| 1 | 调度器改变真实执行顺序：`write_file → read_file` 实际按 `read_file → write_file` 执行，读到旧内容 | 调度分成“全部只读并发 + 全部写串行”两段，读被整体提到写前面 | 改为按原始顺序切段：连续只读工具组成一个并发批，任何副作用工具单独成段并作为屏障 | `agents/tool_scheduler.py` |
+| 2 | Plan Mode 实际写不了计划文件：授权 allow，执行阶段报 `path escapes workspace` | 计划文件在 `~/.bear/plans/`，授权侧特判跳过、执行侧仍走 Workspace 限制，两边边界不一致 | `PolicyEngine.plan_file_path` 改为属性并维护解析后的允许路径，`resolve_workspace_path` 统一放行该单个文件；删掉授权侧的特判 | `agents/policy.py` |
+| 3 | 权限模式与 CLI 承诺不符：`default` 不逐项审批编辑、`acceptEdits` 不再确认危险 Shell、`dontAsk` 反而执行 Shell | P0 重写策略时丢失了原 `check_permission` 的确认矩阵，且 `run_shell` 分支在 `dontAsk` 判断之前返回 | 用 `_confirmation_message()` 统一判定“是否需要确认”，再按模式收敛为 allow/confirm/deny；同时把 `settings.json` 的 allow/deny 规则和危险命令识别并入 `PolicyEngine` | `agents/policy.py`、`agents/tools.py` |
+| 4 | OpenAI 触发预算上限后产生非法消息链，停在 `assistant(tool_calls)` | 只有 Anthropic 分支补了 skipped tool result | 为每个未执行的 `tool_call_id` 回写预算终止结果后再 break，与 Anthropic 对齐 | `agents/agent.py` |
+| 5 | 仓库级 MCP 信任可绕过：未信任的 `.bear/settings.json` 里的 Server 仍被启动 | 信任哈希只覆盖 `.mcp.json`，加载器却还读项目内 `.bear/settings.json` | 信任哈希覆盖全部仓库级声明文件；未信任时只加载用户级 `~/.bear/settings.json`，仓库级配置整体跳过 | `agents/policy.py`、`agents/mcp_client.py` |
+| 6 | `model_timeout_s` 只有字段没有作用 | 模型调用未套超时 | `_call_model_with_timeout()` 对每次调用尝试套 `asyncio.wait_for`，`<=0` 表示关闭 | `agents/agent.py` |
+| 7 | `--resume` 只恢复两组消息 | main 只传了 `anthropicMessages`/`openaiMessages` | 同时恢复 `foldedSessionMemories`、原 Session ID 与 startTime，并保证 OpenAI System Prompt 位于首条 | `agents/main.py`、`agents/agent.py` |
+
+修复后的权限矩阵（`tests/unit/test_permission_matrix.py` 逐格断言）：
+
+| 模式 | 读文件 | 写/编辑文件 | 安全 Shell | `rm a.txt` | skill 写入 |
+|------|--------|-------------|------------|------------|------------|
+| `plan` | allow | deny（计划文件除外） | deny | deny | deny |
+| `default` | allow | confirm | allow | confirm | confirm |
+| `acceptEdits` | allow | allow | allow | confirm | allow |
+| `dontAsk` | allow | deny | allow | deny | deny |
+| `bypassPermissions` | allow | allow | allow | allow | allow |
+
+### 8.2 测试证据（第二轮）
+
+命令与第 4 节相同，镜像 `evocoder-sandbox:latest`：
+
+```bash
+docker run --rm --network=bridge --security-opt no-new-privileges \
+  --user "$(id -u):$(id -g)" \
+  -e HOME=/tmp/evocoder-home -e PYTHONPATH=/workspace \
+  -e PYTHONDONTWRITEBYTECODE=1 -e RUFF_CACHE_DIR=/tmp/ruff-cache \
+  -v "$PWD:/workspace" -w /workspace --entrypoint bash \
+  evocoder-sandbox:latest \
+  -lc 'pip install --user -q pytest pytest-asyncio ruff && python -m pytest -q -o cache_dir=/tmp/pytest'
+```
+
+- 通过数量：87（第一轮 36）
+- 失败数量：0
+- Ruff：`agents/policy.py`、`agents/tool_scheduler.py`、`agents/mcp_client.py`、`agents/runtime_config.py`、`agents/plan_mode.py`、`tests/` 全部通过；全库历史告警由 144 条降到 141 条（顺手删除两个未使用 import，未做全库重写）
+- CLI Smoke：`python -m agents.main --help` 成功
+
+新增/加强的测试：
+
+| 缺陷 | 测试 |
+|------|------|
+| 1 | `test_read_after_write_is_not_hoisted_before_the_write`、`test_read_segments_around_a_write_run_in_order`、`test_consecutive_read_only_calls_still_run_concurrently` |
+| 2 | `tests/integration/test_plan_file_write.py` 全部 3 例、`test_agent_can_write_its_plan_file_through_the_tool_chain`（经由 `Agent._execute_tool_call` 真实工具链，不再用 `Path.write_text` 造数据） |
+| 3 | `tests/unit/test_permission_matrix.py`（5 模式 × 6 场景参数化 + 4 条专项断言） |
+| 4 | `test_openai_budget_stop_closes_every_tool_call`、`test_anthropic_and_openai_agree_on_budget_closure` |
+| 5 | `tests/unit/test_mcp_trust.py` 全部 4 例 |
+| 6 | `test_model_timeout_is_enforced`、`test_model_timeout_disabled_when_not_positive` |
+| 7 | `test_resume_restores_folded_memory_and_session_identity` |
+| 全局 | `tests/conftest.py` 增加 autouse 的 `isolated_home`，测试不再读写真实 `~/.bear` 与 `~/.bear-code` |
+
+### 8.3 仍未处理
+
+- 第 6 节列出的风险项保持不变（容器化 Shell 后端、MCP Streamable HTTP、历史 Ruff 告警、未跑真实模型）。
+- Plan 模式下对同一计划文件的第二次写入仍受“先读后写”保护约束，需要模型先 `read_file`。这是既有行为，本轮未改。
+- P1 未开始。

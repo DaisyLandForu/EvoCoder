@@ -422,8 +422,10 @@ Examples:
             session = load_session(session_id, workspace=runtime_config.workspace)
             if session:
                 agent.restore_session({
+                    "metadata": session.get("metadata"),
                     "anthropicMessages": session.get("anthropicMessages"),
                     "openaiMessages": session.get("openaiMessages"),
+                    "foldedSessionMemories": session.get("foldedSessionMemories"),
                 })
             else:
                 print_info("No session found to resume.")

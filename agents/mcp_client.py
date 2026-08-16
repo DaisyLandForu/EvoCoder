@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from .policy import is_mcp_config_trusted
+from .policy import is_mcp_config_trusted, repo_mcp_config_paths, repo_mcp_declarations
 from .ui import print_error, print_info
 
 
@@ -222,9 +222,6 @@ class McpManager:
         if self._connected:
             return
         self._connected = True
-        if not self.trusted and not is_mcp_config_trusted(self.workspace):
-            print_info("MCP project config is not trusted; servers were not started.")
-            return
         configs = self._load_configs()
         if not configs:
             return
@@ -278,10 +275,16 @@ class McpManager:
         self._connected = False
 
     def _load_configs(self) -> dict[str, dict[str, Any]]:
+        """User-level config is trusted by definition; repository-level config is not."""
         merged: dict[str, dict[str, Any]] = {}
         self._merge_config_file(Path.home() / ".bear" / "settings.json", merged)
-        self._merge_config_file(self.workspace / ".bear" / "settings.json", merged)
-        self._merge_config_file(self.workspace / ".mcp.json", merged)
+        repo_configs = repo_mcp_config_paths(self.workspace)
+        if not self.trusted and not is_mcp_config_trusted(self.workspace):
+            if repo_mcp_declarations(self.workspace):
+                print_info("MCP repository config is not trusted; those servers were not started.")
+            return merged
+        for path in repo_configs:
+            self._merge_config_file(path, merged)
         return merged
 
     def _merge_config_file(self, path: Path, target: dict[str, dict[str, Any]]) -> None:
