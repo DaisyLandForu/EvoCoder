@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 from agents.trace import read_trace, validate_trace
-from benchmarks.runner.run import run_benchmark
+from benchmarks.runner.run import run_benchmark, tasks_digest, validate_manifest
 
 
 @pytest.mark.asyncio
@@ -48,6 +48,24 @@ async def test_benchmark_runner_writes_frozen_artifacts(tmp_path: Path, skill_wo
     assert frozen["task_digest"]
     assert frozen["memory_enabled"] is False
     assert frozen["tools"] == ["read_file", "write_file", "edit_file", "list_files"]
+
+
+def test_task_digest_covers_seeded_task_files() -> None:
+    base = [
+        {
+            "task_id": "se-edit-app",
+            "prompt": "Change src/app.py",
+            "success_check": {"type": "file_contains", "path": "src/app.py", "text": "ready"},
+            "files": {"src/app.py": "A"},
+        }
+    ]
+    changed = [{**base[0], "files": {"src/app.py": "B"}}]
+    assert tasks_digest(base) != tasks_digest(changed)
+
+    manifest = {"task_ids": ["se-edit-app"], "task_digest": tasks_digest(base)}
+    assert validate_manifest(manifest, base) == tasks_digest(base)
+    with pytest.raises(ValueError, match="task_digest"):
+        validate_manifest(manifest, changed)
 
 
 @pytest.mark.asyncio

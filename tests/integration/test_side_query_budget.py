@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 from agents.agent import Agent
-from agents.runtime_config import RuntimeConfig
+from agents.runtime_config import BudgetExceededError, RuntimeConfig
 
 
 @pytest.mark.asyncio
@@ -32,6 +32,35 @@ async def test_side_query_usage_counts_toward_parent_budget(workspace: Path) -> 
     assert agent.total_output_tokens == 27
     assert agent._budget.input_tokens == 111
     assert agent._budget.unknown_usage_count == 0
+
+
+@pytest.mark.asyncio
+async def test_side_query_refuses_to_run_once_the_budget_is_blown(workspace: Path) -> None:
+    config = RuntimeConfig(
+        provider="openai",
+        model="gpt-4o-mini",
+        api_key="test-key",
+        base_url="https://example.invalid/v1",
+        workspace=workspace,
+        max_cost_usd=1.0,
+    )
+    agent = Agent(config=config, is_sub_agent=True)
+    calls: list[int] = []
+
+    async def fake_call():
+        calls.append(1)
+        return SimpleNamespace(
+            usage=None,
+            choices=[SimpleNamespace(message=SimpleNamespace(content="no usage"))],
+        )
+
+    await agent._trace_side_query_call(fake_call, system="sys", user_message="user")
+    assert calls == [1]
+    assert agent._budget.exceeded()["exceeded"] is True
+
+    with pytest.raises(BudgetExceededError):
+        await agent._trace_side_query_call(fake_call, system="sys", user_message="user")
+    assert calls == [1]
 
 
 @pytest.mark.asyncio

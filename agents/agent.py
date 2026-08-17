@@ -19,7 +19,7 @@ from agents.memory import MemoryPrefetch, start_memory_prefetch, format_memories
 from agents.plan_mode import PlanModeController, PlanPhase
 from agents.policy import CONCURRENCY_SAFE_TOOLS as POLICY_SAFE_TOOLS, PolicyDecision, PolicyEngine
 from agents.prompt import build_system_prompt
-from agents.runtime_config import RuntimeConfig
+from agents.runtime_config import BudgetExceededError, RuntimeConfig
 from agents.trace import (
     TraceRecorder,
     emit_trace,
@@ -247,6 +247,8 @@ class Agent:
         self._last_retrieved_skill_hits: list[dict[str, Any]] = []
         self._pending_skill_extraction_window: dict[str, Any] | None = None
         self._background_skill_tasks: set[asyncio.Task] = set()
+        self._memory_prefetch_tasks: set[asyncio.Task] = set()
+        self._run_budget_baseline: dict[str, Any] | None = None
         self._folded_session_memories: list[dict[str, Any]] = []
         self._fold_last_time: float = 0.0
         self._fold_count: int = 0
@@ -258,7 +260,9 @@ class Agent:
         self._run_step_id: str | None = None
 
         #构建系统提示词
-        self._base_system_prompt = custom_system_prompt or build_system_prompt()
+        self._base_system_prompt = custom_system_prompt or build_system_prompt(
+            memory_enabled=self.config.memory_enabled
+        )
 
         if self.permission_mode == "plan":
             self._plan_file_path = self._generate_plan_file_path()
@@ -361,6 +365,19 @@ class Agent:
     async def _trace_side_query_call(self, do, *, system: str, user_message: str):
         started = time.monotonic()
         prompt_hash = hash_prompt({"system": system, "user": user_message})
+        # Side queries spend the same budget as the main loop, so the stop has to
+        # happen here too. Checking only inside BudgetTracker leaves this path free.
+        budget = self._check_budget()
+        if budget["exceeded"]:
+            self._emit_trace(
+                "policy_decision",
+                prompt_hash=prompt_hash,
+                tool_name="side_query",
+                permission_decision="deny",
+                error_type="BudgetExceeded",
+                call_kind="side_query",
+            )
+            raise BudgetExceededError(budget["reason"])
         req = self._emit_trace("model_request", prompt_hash=prompt_hash, call_kind="side_query")
         try:
             resp = await self._call_model_with_timeout(do)
@@ -581,6 +598,7 @@ class Agent:
         owns_run = bool(self.config.trace_enabled) and self._parent_agent is None
         if owns_run:
             self._begin_root_run()
+            self._run_budget_baseline = self._budget.snapshot() if self._budget is not None else None
             prompt_hash = hash_prompt(original_user_message)
             self._run_step_id = self._emit_trace(
                 "run_start",
@@ -631,19 +649,30 @@ class Agent:
                     retrieved_reference=self._last_retrieved_skill_reference,
                 )
         finally:
+            await self._settle_memory_prefetch_tasks()
             if owns_run:
-                budget = self._budget.snapshot() if self._budget is not None else {}
-                unknown = budget.get("usage_status") != "complete"
+                session = self._budget.snapshot() if self._budget is not None else {}
+                run_usage = (
+                    self._budget.delta_since(self._run_budget_baseline)
+                    if self._budget is not None
+                    else {}
+                )
+                unknown = run_usage.get("usage_status") != "complete"
                 self._emit_trace(
                     "run_finished",
                     parent_step_id=self._run_step_id,
                     latency_ms=round((time.monotonic() - started) * 1000, 3),
-                    input_tokens=None if unknown else budget.get("input_tokens", self.total_input_tokens),
-                    output_tokens=None if unknown else budget.get("output_tokens", self.total_output_tokens),
-                    estimated_cost=budget.get("estimated_cost_usd"),
+                    input_tokens=None if unknown else run_usage.get("input_tokens"),
+                    output_tokens=None if unknown else run_usage.get("output_tokens"),
+                    estimated_cost=run_usage.get("estimated_cost_usd"),
                     exit_code=1 if (self._aborted or error_type) else 0,
                     error_type=error_type,
-                    usage_status=budget.get("usage_status"),
+                    usage_status=run_usage.get("usage_status"),
+                    unknown_usage_count=run_usage.get("unknown_usage_count"),
+                    session_input_tokens=session.get("input_tokens"),
+                    session_output_tokens=session.get("output_tokens"),
+                    session_estimated_cost=session.get("estimated_cost_usd"),
+                    session_usage_status=session.get("usage_status"),
                 )
                 TraceRecorder.unbind(tracer_token, parent_token)
         if not self.is_sub_agent:
@@ -697,7 +726,7 @@ class Agent:
     def _refresh_runtime_system_prompt(self) -> None:
         if self._custom_system_prompt is not None:
             return
-        self._base_system_prompt = build_system_prompt()
+        self._base_system_prompt = build_system_prompt(memory_enabled=self.config.memory_enabled)
         if self.permission_mode == "plan":
             self._system_prompt = self._base_system_prompt + self._build_plan_mode_prompt()
         else:
@@ -819,6 +848,29 @@ class Agent:
         tasks = [task for task in self._background_skill_tasks if not task.done()]
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _register_memory_prefetch(self, prefetch: MemoryPrefetch | None) -> None:
+        if prefetch is not None:
+            self._memory_prefetch_tasks.add(prefetch.task)
+
+    async def _settle_memory_prefetch_tasks(self) -> None:
+        """Memory recall must not outlive the run that started it.
+
+        A prefetch left running would emit model events and spend budget after
+        run_finished, which breaks both the trace topology and the run totals.
+        """
+        pending = [task for task in self._memory_prefetch_tasks if not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+            for task in pending:
+                self._emit_trace(
+                    "memory_retrieved",
+                    error_type="CancelledError",
+                    memory_status="cancelled",
+                )
+        self._memory_prefetch_tasks.clear()
 
     def _pop_pending_skill_extraction_window(self, next_user_feedback: str) -> dict[str, Any] | None:
         pending = self._pending_skill_extraction_window
@@ -1681,6 +1733,7 @@ class Agent:
                     user_message, sq,
                     self._already_surfaced_memories, self._session_memory_bytes,
                 )
+                self._register_memory_prefetch(memory_prefetch)
         while True:
             # 外部请求中止时，结束整个 agent loop。
             if self._aborted:
@@ -1804,8 +1857,9 @@ class Agent:
         if timeout <= 0:
             return await do()
         try:
-            return await asyncio.wait_for(do(), timeout=timeout)
-        except asyncio.TimeoutError as exc:
+            async with asyncio.timeout(timeout):
+                return await do()
+        except TimeoutError as exc:
             raise TimeoutError(f"Model call timed out after {timeout:g}s") from exc
 
     async def _call_anthropic_stream(self, on_tool_block_complete=None):
@@ -1908,6 +1962,7 @@ class Agent:
                     user_message, sq,
                     self._already_surfaced_memories, self._session_memory_bytes,
                 )
+                self._register_memory_prefetch(memory_prefetch)
 
         while True:
             if self._aborted:

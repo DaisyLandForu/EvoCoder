@@ -3,7 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from agents.agent import Agent
-from agents.runtime_config import RuntimeConfig, clamp_permission, workspace_id
+from agents.prompt import build_system_prompt
+from agents.runtime_config import BudgetTracker, RuntimeConfig, clamp_permission, workspace_id
 
 
 def test_generation_kwargs_pass_temperature_and_seed(tmp_path: Path) -> None:
@@ -16,6 +17,41 @@ def test_generation_kwargs_pass_temperature_and_seed(tmp_path: Path) -> None:
     )
     agent = Agent(config=config, is_sub_agent=True)
     assert agent._generation_kwargs() == {"temperature": 0.0, "seed": 7}
+
+
+def test_disabled_memory_keeps_the_local_index_out_of_the_prompt(tmp_path: Path, monkeypatch) -> None:
+    marker = "PRIVATE_BENCHMARK_MEMORY_MARKER"
+    monkeypatch.setattr(
+        "agents.prompt.build_memory_prompt_section",
+        lambda: f"# Memory System\n{marker}",
+    )
+    assert marker in build_system_prompt()
+    assert marker not in build_system_prompt(memory_enabled=False)
+
+    enabled = Agent(config=RuntimeConfig(provider="openai", api_key="k", workspace=tmp_path))
+    disabled = Agent(
+        config=RuntimeConfig(provider="openai", api_key="k", workspace=tmp_path, memory_enabled=False)
+    )
+    assert marker in enabled._system_prompt
+    assert marker not in disabled._system_prompt
+
+
+def test_budget_delta_reports_one_run_not_the_session() -> None:
+    budget = BudgetTracker()
+    budget.add_usage(2, 1, known=True)
+    baseline = budget.snapshot()
+    budget.add_usage(5, 3, known=True)
+
+    delta = budget.delta_since(baseline)
+    assert (delta["input_tokens"], delta["output_tokens"]) == (5, 3)
+    assert delta["usage_status"] == "complete"
+    assert delta["estimated_cost_usd"] < budget.cost_usd()
+
+    budget.add_usage(None, None, known=False)
+    later = budget.delta_since(baseline)
+    assert later["unknown_usage_count"] == 1
+    assert later["estimated_cost_usd"] is None
+    assert budget.delta_since(budget.snapshot())["unknown_usage_count"] == 0
 
 
 def test_allowed_tools_filters_definitions(tmp_path: Path) -> None:

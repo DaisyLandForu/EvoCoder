@@ -20,6 +20,10 @@ PERMISSION_RANK: dict[str, int] = {
 READONLY_CHILD_TYPES = frozenset({"explore", "plan"})
 
 
+class BudgetExceededError(RuntimeError):
+    """Raised when a model call is refused because the run is out of budget."""
+
+
 def normalize_workspace(workspace: str | Path | None = None) -> Path:
     """Return a resolved workspace path used as the project identity."""
     return Path(workspace or Path.cwd()).expanduser().resolve()
@@ -87,6 +91,24 @@ class BudgetTracker:
             "unknown_usage_count": self.unknown_usage_count,
             "usage_status": self.usage_status(),
             "current_turns": self.current_turns,
+        }
+
+    def delta_since(self, baseline: dict[str, Any] | None) -> dict[str, Any]:
+        """Usage added after `baseline` was taken, so one run never reports session totals."""
+        base = baseline or {}
+        input_tokens = max(0, self.input_tokens - int(base.get("input_tokens") or 0))
+        output_tokens = max(0, self.output_tokens - int(base.get("output_tokens") or 0))
+        unknown = max(0, self.unknown_usage_count - int(base.get("unknown_usage_count") or 0))
+        known_cost = (input_tokens / 1_000_000) * self.input_usd_per_mtok + (
+            output_tokens / 1_000_000
+        ) * self.output_usd_per_mtok
+        return {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "estimated_cost_usd": None if unknown else known_cost,
+            "known_cost_usd": known_cost,
+            "unknown_usage_count": unknown,
+            "usage_status": "unknown" if unknown else "complete",
         }
 
     def exceeded(self) -> dict[str, Any]:

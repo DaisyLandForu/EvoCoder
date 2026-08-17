@@ -108,3 +108,15 @@ P2 到此结束，未进入后续阶段。
 | `x-api-key` / `proxy-authorization` 未脱敏 | 键名先 `lower().replace("-", "_")` 再匹配，并覆盖嵌套工具参数 |
 
 复验建议：清理沙箱代理环境变量后跑 `ruff check agents tests benchmarks` 与 `pytest -q`，并确认同一 `--run-id` 连续两次除时间/ID 外结果一致。本轮沙箱结果：`208 passed`，Ruff 全绿。
+
+## 10. 审查返工（`2174e75` 边界缺口）
+
+`2174e75` 的四条主修复生效后，复验仍指出 3 个边界缺口。本轮只修这些项，未进入后续阶段。
+
+| 缺口 | 修复 |
+|------|------|
+| Memory 预取未纳入 drain，事件和成本写在 `run_finished` 之后 | 预取任务登记到 `_memory_prefetch_tasks`；终止前 cancel + await，并记录 `memory_status=cancelled` |
+| Side Query 调用前不检查预算；`run_finished` 写会话累计 | `_trace_side_query_call` 先 `_check_budget()`，超限不再发请求；终止事件写本 run 增量，`session_*` 写会话累计 |
+| `memory_enabled=false` 仍注入本机 Memory Index；`task_digest` 忽略 `files` | `build_system_prompt(memory_enabled=...)` 关闭时不读本地索引；digest 哈希完整任务对象 |
+
+本轮沙箱：`214 passed`，Ruff 全绿。未进入后续阶段。

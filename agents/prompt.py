@@ -207,15 +207,26 @@ def get_git_context() -> str:
         return ""
 
 
-def build_system_prompt() -> str:
-    """Build the full system prompt from embedded template + dynamic context."""
+MEMORY_DISABLED_SECTION = (
+    "# Memory System\n\n"
+    "The persistent memory system is disabled for this run. "
+    "No stored memories are available and none may be written."
+)
+
+
+def build_system_prompt(*, memory_enabled: bool = True) -> str:
+    """Build the full system prompt from embedded template + dynamic context.
+
+    A disabled memory system must keep local memory out of the prompt entirely,
+    otherwise a frozen benchmark run still reads host state.
+    """
     from datetime import date
     today = date.today().isoformat()
     plat = f"{platform.system()} {platform.machine()}"
     shell = (os.environ.get("ComSpec") or "cmd.exe") if sys.platform == "win32" else os.environ.get("SHELL", "/bin/sh")
     git_context = get_git_context()
     claude_md = load_claude_md()
-    memory_section = build_memory_prompt_section()
+    memory_section = build_memory_prompt_section() if memory_enabled else MEMORY_DISABLED_SECTION
     skills_section = build_skill_descriptions()
     agent_section = build_agent_descriptions()
 

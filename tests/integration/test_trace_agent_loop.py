@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from agents.agent import Agent
+from agents.memory import MemoryPrefetch
 from agents.runtime_config import RuntimeConfig
 from agents.trace import read_trace, validate_trace
 
@@ -312,3 +315,107 @@ async def test_skill_candidate_is_emitted_before_run_finished(
     assert types[-1] == "run_finished"
     assert types.index("skill_candidate_created") < types.index("run_finished")
     assert validate_trace(events) == []
+
+
+@pytest.mark.asyncio
+async def test_memory_prefetch_cannot_emit_after_run_finished(
+    workspace: Path, tmp_path: Path, monkeypatch
+) -> None:
+    trace_path = tmp_path / "memory.jsonl"
+    config = RuntimeConfig(
+        provider="openai",
+        model="gpt-4o-mini",
+        api_key="test-key",
+        base_url="https://example.invalid/v1",
+        workspace=workspace,
+        permission_mode="bypassPermissions",
+        trace_enabled=True,
+        trace_path=trace_path,
+        max_turns=4,
+    )
+    agent = Agent(config=config, is_sub_agent=False)
+    hold = asyncio.Event()
+    monkeypatch.setenv("BEAR_AUTO_SKILL_EVOLUTION", "0")
+
+    async def blocked_side_query(_system: str, _user: str) -> str:
+        async def _call():
+            await hold.wait()
+            return SimpleNamespace(
+                usage=SimpleNamespace(prompt_tokens=7, completion_tokens=2),
+                choices=[SimpleNamespace(message=SimpleNamespace(content="late memory"))],
+            )
+
+        await agent._trace_side_query_call(_call, system="sys", user_message="user")
+        return "[]"
+
+    monkeypatch.setattr(
+        "agents.agent.start_memory_prefetch",
+        lambda *_args, **_kwargs: MemoryPrefetch(asyncio.create_task(blocked_side_query("sys", "user"))),
+    )
+
+    async def fake_stream() -> dict:
+        agent._emit_text("fast")
+        return {
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "fast", "tool_calls": None},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1},
+        }
+
+    agent._call_openai_stream = fake_stream
+    await agent.chat("please recall the project background")
+    settled = read_trace(trace_path)
+    hold.set()
+    await asyncio.sleep(0.05)
+
+    events = read_trace(trace_path)
+    assert [event["event_type"] for event in events] == [
+        event["event_type"] for event in settled
+    ]
+    assert validate_trace(events) == []
+    assert events[-1]["event_type"] == "run_finished"
+    cancelled = [event for event in events if event.get("memory_status") == "cancelled"]
+    assert cancelled
+    assert agent.total_input_tokens == 3
+    assert agent.total_output_tokens == 1
+
+
+@pytest.mark.asyncio
+async def test_run_finished_reports_this_run_not_session_totals(
+    workspace: Path, tmp_path: Path
+) -> None:
+    trace_dir = tmp_path / "per-run"
+    agent = _agent(workspace, trace_dir)
+
+    async def fake_stream() -> dict:
+        return {
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "ok", "tool_calls": None},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 1},
+        }
+
+    agent._call_openai_stream = fake_stream
+    await agent.chat("first")
+    first_id = agent._run_id
+    await agent.chat("second")
+    second_id = agent._run_id
+
+    first = next(
+        event for event in read_trace(trace_dir / f"{first_id}.jsonl")
+        if event["event_type"] == "run_finished"
+    )
+    second = next(
+        event for event in read_trace(trace_dir / f"{second_id}.jsonl")
+        if event["event_type"] == "run_finished"
+    )
+    assert (first["input_tokens"], first["output_tokens"]) == (2, 1)
+    assert (second["input_tokens"], second["output_tokens"]) == (2, 1)
+    assert (second["session_input_tokens"], second["session_output_tokens"]) == (4, 2)
+    assert second["estimated_cost"] < second["session_estimated_cost"]

@@ -67,15 +67,8 @@ def new_run_id() -> str:
 
 
 def tasks_digest(tasks: list[dict[str, Any]]) -> str:
-    payload = [
-        {
-            "task_id": task.get("task_id"),
-            "prompt": task.get("prompt"),
-            "success_check": task.get("success_check"),
-        }
-        for task in tasks
-    ]
-    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    """Hash every task field, including seeded `files`, so any input edit is caught."""
+    encoded = json.dumps(list(tasks), ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
