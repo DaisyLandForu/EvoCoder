@@ -47,6 +47,7 @@ ARM_NO_SKILL = "no_skill"
 ARM_CHAMPION = "current_champion"
 ARM_CANDIDATE = "candidate"
 ARMS = (ARM_NO_SKILL, ARM_CHAMPION, ARM_CANDIDATE)
+EVALUABLE_STATUSES = frozenset({STATUS_CANDIDATE, STATUS_SHADOW})
 
 ORIGIN_REPLAY = "replay"
 ORIGIN_HOLDOUT = "holdout"
@@ -328,9 +329,15 @@ async def _run_arm(
 
 
 def _judge_infrastructure_error(score: dict[str, Any]) -> str:
+    direct = str(score.get("infrastructure_error") or "").strip()
+    if direct:
+        return direct
     for item in score.get("rules") or []:
         if not isinstance(item, dict):
             continue
+        error = str(item.get("infrastructure_error") or "").strip()
+        if error:
+            return error
         details = item.get("details") if isinstance(item.get("details"), dict) else {}
         if item.get("skipped"):
             return str(details.get("reason") or "judge skipped")
@@ -379,8 +386,23 @@ async def run_paired_evaluation(
 
     registry = load_registry()
     entry = registry.get("skills", {}).get(skill_name, {}).get("versions", {}).get(version, {})
-    if str(entry.get("status") or "") == STATUS_CANDIDATE:
+    if not isinstance(entry, dict):
+        entry = {}
+    status = str(entry.get("status") or "")
+    if not entry or status not in EVALUABLE_STATUSES:
+        return {
+            "ok": False,
+            "error": (
+                f"{skill_name}@{version} is '{status or 'missing'}'; "
+                "only candidate or shadow versions can be evaluated"
+            ),
+            "skill": skill_name,
+            "version": version,
+            "status": status,
+        }
+    if status == STATUS_CANDIDATE:
         transition(skill_name, version, STATUS_SHADOW, reason="shadow evaluation started", actor="evaluator")
+        entry = load_registry().get("skills", {}).get(skill_name, {}).get("versions", {}).get(version, entry)
 
     provenance = entry.get("source_provenance") if isinstance(entry.get("source_provenance"), dict) else {}
     generation_sample_ids = {str(item) for item in (provenance.get("sample_ids") or []) if str(item).strip()}
@@ -510,7 +532,19 @@ async def run_paired_evaluation(
         artifact["artifact_path"] = str(target)
 
     decision = gate["decision"]
-    if decision == DECISION_PROMOTE:
+    live_status = str(
+        load_registry().get("skills", {}).get(skill_name, {}).get("versions", {}).get(version, {}).get("status")
+        or status
+    )
+    if live_status not in EVALUABLE_STATUSES:
+        artifact["lifecycle"] = {
+            "ok": False,
+            "error": (
+                f"refusing to mutate {skill_name}@{version} from {live_status}; "
+                "only candidate or shadow versions can change via gate"
+            ),
+        }
+    elif decision == DECISION_PROMOTE:
         outcome = mark_champion(
             skill_name, version, reason=f"gate passed in run {run_id}", actor="gate"
         )

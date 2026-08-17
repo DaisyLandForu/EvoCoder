@@ -576,3 +576,114 @@ async def test_artifact_write_failure_does_not_create_a_champion(skill_workspace
         json.loads((reg.champion_dir(SKILL) / "meta.json").read_text(encoding="utf-8")).get("version")
         != version
     )
+
+
+async def test_string_false_judge_verdict_is_infrastructure_not_a_pass(skill_workspace: Path):
+    version = _seed_skill(champion_instructions="Cite sources.", candidate_instructions="Always cite sources.")
+
+    async def _judge(system: str, user: str) -> str:
+        return json.dumps({"pass": "false", "reason": "looks bad"})
+
+    artifact = await run_paired_evaluation(
+        skill_name=SKILL,
+        candidate_version=version,
+        generate=_arm_generator(
+            {ARM_NO_SKILL: "plain", ARM_CHAMPION: "plain", ARM_CANDIDATE: "see https://b"}
+        ),
+        judge=_judge,
+        generation_config=_config(),
+        judge_config=_judge_config(independent=True),
+        gate_config=_permissive_gate(),
+        samples=_samples(20),
+    )
+
+    assert artifact["metrics"]["gate"]["invalid_pairs"] == 20
+    assert artifact["metrics"]["gate"]["paired_gain"] == 0
+    assert artifact["gate"]["decision"] == DECISION_INCUBATING
+    assert reg.load_registry()["skills"][SKILL]["versions"][version]["status"] == reg.STATUS_SHADOW
+    assert json.loads((reg.champion_dir(SKILL) / "meta.json").read_text(encoding="utf-8")).get("version") != version
+
+
+async def test_empty_and_non_json_judge_payloads_invalidate_the_pair(skill_workspace: Path):
+    version = _seed_skill(champion_instructions="Cite sources.", candidate_instructions="Always cite sources.")
+
+    async def _judge(system: str, user: str) -> str:
+        return ""
+
+    artifact = await run_paired_evaluation(
+        skill_name=SKILL,
+        candidate_version=version,
+        generate=_arm_generator(
+            {ARM_NO_SKILL: "plain", ARM_CHAMPION: "plain", ARM_CANDIDATE: "see https://b"}
+        ),
+        judge=_judge,
+        generation_config=_config(),
+        judge_config=_judge_config(independent=True),
+        gate_config=_permissive_gate(),
+        samples=_samples(3),
+    )
+
+    assert artifact["gate"]["decision"] == DECISION_INCUBATING
+    assert artifact["metrics"]["gate"]["invalid_pairs"] == 3
+    assert all(sample["infrastructure_error"] for sample in artifact["samples"])
+
+
+async def test_evaluating_a_champion_version_is_refused(skill_workspace: Path):
+    candidate_version = _seed_skill(
+        champion_instructions="Cite sources.", candidate_instructions="Always cite sources."
+    )
+    champion_version = reg.load_registry()["skills"][SKILL]["champion_version"]
+    assert champion_version
+    assert champion_version != candidate_version
+
+    artifact = await run_paired_evaluation(
+        skill_name=SKILL,
+        candidate_version=champion_version,
+        generate=_arm_generator(
+            {ARM_NO_SKILL: "plain", ARM_CHAMPION: "see https://a", ARM_CANDIDATE: "plain"}
+        ),
+        generation_config=_config(),
+        judge_config=_judge_config(independent=True),
+        gate_config=_permissive_gate(),
+        samples=_samples(4),
+    )
+
+    assert not artifact["ok"]
+    assert "candidate or shadow" in artifact["error"]
+    node = reg.load_registry()["skills"][SKILL]
+    assert node["champion_version"] == champion_version
+    assert node["versions"][champion_version]["status"] == reg.STATUS_CHAMPION
+    assert node["versions"][candidate_version]["status"] == reg.STATUS_CANDIDATE
+    assert (reg.champion_dir(SKILL) / "SKILL.md").is_file()
+    assert reg.verify_consistency()["ok"], reg.verify_consistency()["problems"]
+
+
+async def test_evaluating_an_active_version_is_refused(skill_workspace: Path):
+    candidate_version = _seed_skill(
+        champion_instructions="Cite sources.", candidate_instructions="Always cite sources."
+    )
+    champion_version = reg.load_registry()["skills"][SKILL]["champion_version"]
+    promoted = reg.promote(SKILL, champion_version)
+    assert promoted["ok"], promoted
+    before = reg.active_skill_file(SKILL).read_text(encoding="utf-8")
+
+    artifact = await run_paired_evaluation(
+        skill_name=SKILL,
+        candidate_version=champion_version,
+        generate=_arm_generator(
+            {ARM_NO_SKILL: "plain", ARM_CHAMPION: "see https://a", ARM_CANDIDATE: "plain"}
+        ),
+        generation_config=_config(),
+        judge_config=_judge_config(independent=True),
+        gate_config=_permissive_gate(),
+        samples=_samples(4),
+    )
+
+    assert not artifact["ok"]
+    assert "candidate or shadow" in artifact["error"]
+    node = reg.load_registry()["skills"][SKILL]
+    assert node["active_version"] == champion_version
+    assert node["versions"][champion_version]["status"] == reg.STATUS_ACTIVE
+    assert node["versions"][candidate_version]["status"] == reg.STATUS_CANDIDATE
+    assert reg.active_skill_file(SKILL).read_text(encoding="utf-8") == before
+    assert "Cite sources." in before

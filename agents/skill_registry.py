@@ -998,7 +998,9 @@ def verify_consistency() -> dict[str, Any]:
             parsed = parse_skill_markdown(skill_md.read_text(encoding="utf-8"))
             name = str(parsed.get("name") or skill_md.parent.name).strip()
             node = skills.get(name)
-            if not isinstance(node, dict) or not str(node.get("active_version") or ""):
+            # Handmade /skill-create skills are not in the registry. Only governed
+            # skills with a registry node but no active_version are drift.
+            if isinstance(node, dict) and not str(node.get("active_version") or ""):
                 problems.append(f"{name}: active file {skill_md} has no registry record")
 
     return {"ok": not problems, "problems": problems}

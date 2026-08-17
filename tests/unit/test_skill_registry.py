@@ -322,10 +322,20 @@ def test_rejected_force_promote_does_not_write_active(skill_workspace: Path):
     assert reg.verify_consistency()["ok"], reg.verify_consistency()["problems"]
 
 
-def test_consistency_reports_active_file_without_registry_record(skill_workspace: Path):
-    path = reg.active_skill_file("orphan")
+def test_consistency_ignores_handmade_active_skills_without_registry(skill_workspace: Path):
+    path = reg.active_skill_file("manual-style")
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("---\nname: orphan\nversion: 0.1.0\n---\n\nbody\n", encoding="utf-8")
+    path.write_text("---\nname: manual-style\nversion: 0.1.0\n---\n\nHandmade skill.\n", encoding="utf-8")
+
+    check = reg.verify_consistency()
+    assert check["ok"], check["problems"]
+
+
+def test_consistency_reports_governed_active_file_without_active_version(skill_workspace: Path):
+    created = _candidate(skill_workspace)
+    path = reg.active_skill_file("answer-style")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text((reg.candidate_dir("answer-style", created["version"]) / "SKILL.md").read_text(encoding="utf-8"))
 
     check = reg.verify_consistency()
     assert not check["ok"]

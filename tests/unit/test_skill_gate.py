@@ -8,6 +8,28 @@ from agents.skill_gate import (
     apply_gate,
     compute_paired_metrics,
 )
+from agents.skill_rules import parse_judge_verdict
+
+
+def test_judge_verdict_accepts_only_json_booleans():
+    assert parse_judge_verdict('{"pass": true, "reason": "ok"}')["passed"] is True
+    assert parse_judge_verdict('{"pass": false}')["passed"] is False
+
+
+def test_judge_verdict_rejects_string_false_and_other_payloads():
+    for raw in (
+        '{"pass": "false"}',
+        '{"pass": "true"}',
+        '{"pass": 1}',
+        '{"reason": "ok"}',
+        "",
+        "false",
+        "not json",
+        "[]",
+    ):
+        verdict = parse_judge_verdict(raw)
+        assert verdict["ok"] is False, raw
+        assert "passed" not in verdict or verdict.get("passed") is not True
 
 
 def _pairs(

@@ -27,12 +27,18 @@ def normalize_text(text: str) -> str:
 
 
 def parse_json_object(text: str) -> dict[str, Any]:
+    parsed = parse_json_object_strict(text)
+    return parsed if parsed is not None else {}
+
+
+def parse_json_object_strict(text: str) -> dict[str, Any] | None:
+    """Return a dict only when the payload is JSON object text; otherwise None."""
     raw = str(text or "").strip()
     if not raw:
-        return {}
+        return None
     try:
         parsed = json.loads(raw)
-        return parsed if isinstance(parsed, dict) else {}
+        return parsed if isinstance(parsed, dict) else None
     except ValueError:
         pass
     start = raw.find("{")
@@ -41,9 +47,29 @@ def parse_json_object(text: str) -> dict[str, Any]:
         try:
             parsed = json.loads(raw[start : end + 1])
         except ValueError:
-            return {}
-        return parsed if isinstance(parsed, dict) else {}
-    return {}
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def parse_judge_verdict(text: str) -> dict[str, Any]:
+    """Accept only `{"pass": true|false}`. Any other payload is an infrastructure failure."""
+    raw = str(text or "").strip()
+    if not raw:
+        return {"ok": False, "error": "judge returned empty response"}
+    parsed = parse_json_object_strict(raw)
+    if parsed is None:
+        return {"ok": False, "error": "judge returned non-JSON or a non-object"}
+    if "pass" not in parsed:
+        return {"ok": False, "error": "judge JSON is missing boolean field 'pass'"}
+    value = parsed.get("pass")
+    if not isinstance(value, bool):
+        return {
+            "ok": False,
+            "error": f"judge 'pass' must be a JSON boolean, got {type(value).__name__}",
+        }
+    reason = str(parsed.get("reason") or "").strip() or "judge returned no reason"
+    return {"ok": True, "passed": value, "reason": reason[:500]}
 
 
 def paragraph_limit(text: str) -> int:
@@ -321,7 +347,13 @@ async def evaluate_rule_async(
     if not requirement:
         return {**base, "passed": False, "details": {"error": "missing_requirement_text"}}
     if judge is None:
-        return {**base, "passed": False, "skipped": True, "details": {"reason": "judge_llm_not_configured"}}
+        return {
+            **base,
+            "passed": False,
+            "skipped": True,
+            "infrastructure_error": "judge_llm_not_configured",
+            "details": {"reason": "judge_llm_not_configured"},
+        }
 
     system = (
         "You are a strict binary evaluator.\n"
@@ -339,10 +371,26 @@ async def evaluate_rule_async(
     try:
         raw = await judge(system, json.dumps(payload, ensure_ascii=False))
     except Exception as exc:  # judge failures must not crash the run
-        return {**base, "passed": False, "details": {"reason": f"judge failed: {exc}"[:500]}}
-    parsed = parse_json_object(raw)
-    reason = str(parsed.get("reason") or "").strip() or "judge returned no reason"
-    return {**base, "passed": bool(parsed.get("pass", False)), "details": {"reason": reason[:500]}}
+        return {
+            **base,
+            "passed": False,
+            "infrastructure_error": f"judge failed: {exc}"[:500],
+            "details": {"reason": f"judge failed: {exc}"[:500]},
+        }
+    verdict = parse_judge_verdict(raw)
+    if not verdict.get("ok"):
+        error = str(verdict.get("error") or "judge returned an invalid verdict")
+        return {
+            **base,
+            "passed": False,
+            "infrastructure_error": error,
+            "details": {"reason": error, "raw": str(raw)[:200]},
+        }
+    return {
+        **base,
+        "passed": bool(verdict["passed"]),
+        "details": {"reason": str(verdict.get("reason") or "")[:500]},
+    }
 
 
 async def score_response(
@@ -358,13 +406,16 @@ async def score_response(
         outcomes.append(
             await evaluate_rule_async(rule, response_text, user_message=user_message, judge=judge)
         )
-    hard_failures = [item for item in outcomes if item.get("hard") and not item.get("passed")]
-    soft_total = len([item for item in outcomes if not item.get("hard")])
-    soft_passed = len([item for item in outcomes if not item.get("hard") and item.get("passed")])
+    infra = [item for item in outcomes if item.get("infrastructure_error")]
+    behavioral = [item for item in outcomes if not item.get("infrastructure_error")]
+    hard_failures = [item for item in behavioral if item.get("hard") and not item.get("passed")]
+    soft_total = len([item for item in behavioral if not item.get("hard")])
+    soft_passed = len([item for item in behavioral if not item.get("hard") and item.get("passed")])
     return {
         "rules": outcomes,
-        "passed": not hard_failures and all(item.get("passed") for item in outcomes),
+        "passed": not infra and not hard_failures and all(item.get("passed") for item in behavioral),
         "hard_failed": bool(hard_failures),
         "hard_failures": [item.get("rule_id") for item in hard_failures],
         "soft_pass_rate": (soft_passed / soft_total) if soft_total else 1.0,
+        "infrastructure_error": str(infra[0].get("infrastructure_error") or "") if infra else "",
     }
