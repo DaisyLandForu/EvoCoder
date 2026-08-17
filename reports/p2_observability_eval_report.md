@@ -128,3 +128,5 @@ P2 到此结束，未进入后续阶段。
 | 缺口 | 修复 |
 |------|------|
 | REPL 命令污染已结束的 chat Trace，评测事件丢失 | 统一 `_traced_operation`：新 `run_id` → bind → 执行 → 结算 → `run_finished` → unbind；结束后清空 Recorder，避免继续追加 |
+
+本轮沙箱：`217 passed`，Ruff 全绿。未进入后续阶段。
