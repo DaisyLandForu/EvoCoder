@@ -307,22 +307,46 @@ async def _run_arm(
     score = await score_response(
         rules=rules, response_text=result.text, user_message=sample.user_message, judge=judge
     )
+    infrastructure_error = str(result.error or "").strip() or _judge_infrastructure_error(score)
     return {
         "arm": arm,
         "sample_id": sample.sample_id,
         "system_prompt_hash": _prompt_hash(system_prompt),
         "response": result.text,
         "error": result.error,
+        "infrastructure_error": infrastructure_error,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": input_tokens + output_tokens,
         "latency_s": round(time.monotonic() - started, 4),
-        "passed": bool(score["passed"]) and not result.error,
-        "hard_failed": bool(score["hard_failed"]) or bool(result.error),
+        "passed": bool(score["passed"]) and not infrastructure_error,
+        "hard_failed": bool(score["hard_failed"]) and not infrastructure_error,
         "hard_failures": score["hard_failures"],
         "soft_pass_rate": score["soft_pass_rate"],
         "rules": score["rules"],
     }
+
+
+def _judge_infrastructure_error(score: dict[str, Any]) -> str:
+    for item in score.get("rules") or []:
+        if not isinstance(item, dict):
+            continue
+        details = item.get("details") if isinstance(item.get("details"), dict) else {}
+        if item.get("skipped"):
+            return str(details.get("reason") or "judge skipped")
+        reason = str(details.get("reason") or "")
+        if reason.startswith("judge failed"):
+            return reason
+    return ""
+
+
+def _pair_infrastructure_error(arms: dict[str, dict[str, Any]]) -> str:
+    for arm_name in ARMS:
+        arm = arms.get(arm_name) or {}
+        error = str(arm.get("infrastructure_error") or "").strip()
+        if error:
+            return f"{arm_name}: {error}"
+    return ""
 
 
 async def run_paired_evaluation(
@@ -411,30 +435,40 @@ async def run_paired_evaluation(
         # With no champion yet, the champion arm degenerates to the no-skill baseline.
         champion_pass = bool(champion_arm["passed"]) if champion else bool(arms[ARM_NO_SKILL]["passed"])
         champion_tokens = champion_arm["total_tokens"] if champion else arms[ARM_NO_SKILL]["total_tokens"]
+        infrastructure_error = _pair_infrastructure_error(arms)
         sample_results.append(
             {
                 "sample_id": sample.sample_id,
                 "origin": sample.origin,
                 "user_message": sample.user_message,
                 "arms": arms,
-                "champion_pass": champion_pass,
-                "candidate_pass": bool(candidate_arm["passed"]),
-                "no_skill_pass": bool(arms[ARM_NO_SKILL]["passed"]),
-                "candidate_hard_failed": bool(candidate_arm["hard_failed"]),
+                "valid": not infrastructure_error,
+                "infrastructure_error": infrastructure_error,
+                "champion_pass": champion_pass if not infrastructure_error else False,
+                "candidate_pass": bool(candidate_arm["passed"]) if not infrastructure_error else False,
+                "no_skill_pass": bool(arms[ARM_NO_SKILL]["passed"]) if not infrastructure_error else False,
+                "candidate_hard_failed": bool(candidate_arm["hard_failed"]) and not infrastructure_error,
                 "champion_tokens": champion_tokens,
                 "candidate_tokens": candidate_arm["total_tokens"],
                 "no_skill_tokens": arms[ARM_NO_SKILL]["total_tokens"],
-                "pair_delta": int(bool(candidate_arm["passed"])) - int(champion_pass),
+                "pair_delta": (
+                    int(bool(candidate_arm["passed"])) - int(champion_pass) if not infrastructure_error else 0
+                ),
             }
         )
 
     holdout_pairs = [item for item in sample_results if item["origin"] == ORIGIN_HOLDOUT]
     replay_pairs = [item for item in sample_results if item["origin"] == ORIGIN_REPLAY]
-    gated_pairs = holdout_pairs if holdout_pairs else []
+    valid_holdout = [item for item in holdout_pairs if item.get("valid")]
+    valid_replay = [item for item in replay_pairs if item.get("valid")]
+    invalid_holdout = len(holdout_pairs) - len(valid_holdout)
+    invalid_replay = len(replay_pairs) - len(valid_replay)
+    gated_pairs = valid_holdout if holdout_pairs else []
+    invalid_for_gate = invalid_holdout if holdout_pairs else invalid_replay
 
-    metrics_holdout = compute_paired_metrics(holdout_pairs)
-    metrics_replay = compute_paired_metrics(replay_pairs)
-    metrics_gate = compute_paired_metrics(gated_pairs)
+    metrics_holdout = compute_paired_metrics(valid_holdout, invalid_pairs=invalid_holdout)
+    metrics_replay = compute_paired_metrics(valid_replay, invalid_pairs=invalid_replay)
+    metrics_gate = compute_paired_metrics(gated_pairs, invalid_pairs=invalid_for_gate)
     gate = apply_gate(
         metrics_gate,
         config=gate_config,
@@ -458,6 +492,9 @@ async def run_paired_evaluation(
         "sample_pool": {
             "replay_count": len(replay_pairs),
             "holdout_count": len(holdout_pairs),
+            "valid_holdout_count": len(valid_holdout),
+            "valid_replay_count": len(valid_replay),
+            "invalid_pairs": invalid_for_gate,
             "contaminated_holdout_ids": pool["contaminated_holdout_ids"],
             "generation_sample_ids": pool["generation_sample_ids"],
         },
@@ -465,6 +502,12 @@ async def run_paired_evaluation(
         "gate": gate,
         "samples": sample_results,
     }
+
+    if persist:
+        target = evaluations_root() / _safe_skill_slug(skill_name) / f"{run_id}.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(target, json.dumps(artifact, ensure_ascii=False, indent=2) + "\n")
+        artifact["artifact_path"] = str(target)
 
     decision = gate["decision"]
     if decision == DECISION_PROMOTE:
@@ -488,11 +531,11 @@ async def run_paired_evaluation(
             "reasons": gate["incubating_reasons"],
         }
 
-    if persist:
-        target = evaluations_root() / _safe_skill_slug(skill_name) / f"{run_id}.json"
-        target.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_text(target, json.dumps(artifact, ensure_ascii=False, indent=2) + "\n")
-        artifact["artifact_path"] = str(target)
+    if persist and artifact.get("artifact_path"):
+        atomic_write_text(
+            Path(artifact["artifact_path"]),
+            json.dumps(artifact, ensure_ascii=False, indent=2) + "\n",
+        )
 
     artifact["ok"] = True
     return artifact
@@ -531,7 +574,8 @@ def format_evaluation_summary(artifact: dict[str, Any]) -> str:
         f"  paired gain={metrics.get('paired_gain', 0)} "
         f"NTR={metrics.get('negative_transfer_rate', 0):.3f} "
         f"cost_growth={metrics.get('cost_growth', 0):.3f} "
-        f"hard_failures={metrics.get('candidate_hard_failures', 0)}",
+        f"hard_failures={metrics.get('candidate_hard_failures', 0)} "
+        f"invalid_pairs={metrics.get('invalid_pairs', 0)}",
         f"  decision: {gate.get('decision', '')}",
     ]
     for reason in gate.get("blocking_reasons", []):

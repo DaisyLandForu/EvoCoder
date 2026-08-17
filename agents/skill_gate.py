@@ -74,10 +74,11 @@ class GateConfig:
         return asdict(self)
 
 
-def compute_paired_metrics(pairs: list[dict[str, Any]]) -> dict[str, Any]:
+def compute_paired_metrics(pairs: list[dict[str, Any]], *, invalid_pairs: int = 0) -> dict[str, Any]:
     """Aggregate per-sample paired outcomes into the metrics the gate reads.
 
     NTR = #(champion passes but candidate fails) / #(champion passes).
+    `pairs` must already exclude infrastructure failures.
     """
     total = len(pairs)
     champion_pass = sum(1 for pair in pairs if pair.get("champion_pass"))
@@ -96,6 +97,7 @@ def compute_paired_metrics(pairs: list[dict[str, Any]]) -> dict[str, Any]:
 
     return {
         "paired_samples": total,
+        "invalid_pairs": int(invalid_pairs),
         "champion_pass": champion_pass,
         "candidate_pass": candidate_pass,
         "no_skill_pass": no_skill_pass,
@@ -142,6 +144,11 @@ def apply_gate(
         incubating.append("no holdout samples independent of candidate generation")
     if not independent_judge and not config.allow_non_independent_judge_promotion:
         incubating.append("judge is not independent of the generator; automatic promotion is disabled")
+    invalid_pairs = int(metrics.get("invalid_pairs") or 0)
+    if invalid_pairs > 0:
+        incubating.append(
+            f"{invalid_pairs} pairs discarded due to generation/judge infrastructure failure"
+        )
 
     gain = int(metrics.get("paired_gain") or 0)
     if gain < config.min_paired_gain:
@@ -164,6 +171,10 @@ def apply_gate(
     if hard_failures > config.allow_hard_failures:
         # A safety or format failure blocks regardless of how much evidence exists.
         decision = DECISION_REJECT
+    elif invalid_pairs > 0:
+        # Infrastructure failures make the comparison unusable; do not promote or reject.
+        decision = DECISION_INCUBATING
+        blocking = []
     elif paired_samples <= 0:
         # No usable pairs means no verdict, not a rejection.
         decision = DECISION_INCUBATING

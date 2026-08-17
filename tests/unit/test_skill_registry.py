@@ -58,6 +58,7 @@ def test_one_off_facts_are_stripped_from_candidates(skill_workspace: Path):
             "Email ops@example.com and open https://internal.example.com/runbook on 2024-03-11.\n"
             "Ticket 1234567 was filed by @alice with token sk-abcdef0123456789abcd.\n"
             "The log is at /home/alice/logs/deploy.log.\n"
+            "Also check /etc/shadow, /opt/deploy/run.sh, C:\\Users\\alice\\secret.txt and \\\\nas\\share\\runbook on 11/03/2024.\n"
         ),
         source_provenance={"kind": "user_feedback"},
     )
@@ -72,6 +73,11 @@ def test_one_off_facts_are_stripped_from_candidates(skill_workspace: Path):
         "sk-abcdef0123456789abcd",
         "/home/alice/logs",
         "@alice",
+        "/etc/shadow",
+        "/opt/deploy/run.sh",
+        r"C:\Users\alice\secret.txt",
+        r"\\nas\share\runbook",
+        "11/03/2024",
     ):
         assert leak not in body, leak
     assert "<redacted:" in body
@@ -263,3 +269,78 @@ def test_status_report_lists_lifecycle_state(skill_workspace: Path):
     report = reg.skill_status_report()
     assert "answer-style" in report
     assert reg.STATUS_CHAMPION in report
+
+
+def test_promote_loads_the_requested_version_not_the_current_pointer(skill_workspace: Path):
+    first = _candidate(skill_workspace, instructions="Version one guidance.")
+    reg.mark_champion("answer-style", first["version"], reason="test")
+    second = _candidate(skill_workspace, instructions="Version two guidance.")
+    pointer = reg.champion_dir("answer-style") / "SKILL.md"
+    pointer.write_text(
+        (reg.candidate_dir("answer-style", second["version"]) / "SKILL.md").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    outcome = reg.promote("answer-style", first["version"])
+
+    assert outcome["ok"], outcome
+    active = reg.active_skill_file("answer-style").read_text(encoding="utf-8")
+    parsed = reg.parse_skill_markdown(active)
+    assert parsed["version"] == first["version"]
+    assert "Version one guidance." in active
+    assert "Version two guidance." not in active
+
+
+def test_new_champion_retires_the_previous_champion(skill_workspace: Path):
+    first = _candidate(skill_workspace, instructions="First champion.")
+    reg.mark_champion("answer-style", first["version"], reason="first")
+    second = _candidate(skill_workspace, instructions="Second champion.")
+    reg.mark_champion("answer-style", second["version"], reason="second")
+
+    node = reg.load_registry()["skills"]["answer-style"]
+    assert node["champion_version"] == second["version"]
+    assert node["versions"][first["version"]]["status"] == reg.STATUS_RETIRED
+    assert node["versions"][second["version"]]["status"] == reg.STATUS_CHAMPION
+    assert "Second champion." in (reg.champion_dir("answer-style") / "SKILL.md").read_text(encoding="utf-8")
+    assert "Second champion." in reg.champion_version_file("answer-style", second["version"]).read_text(
+        encoding="utf-8"
+    )
+
+
+def test_rejected_force_promote_does_not_write_active(skill_workspace: Path):
+    created = _candidate(skill_workspace, instructions="Rejected guidance.")
+    rejected = reg.transition("answer-style", created["version"], reg.STATUS_REJECTED, reason="gate")
+    assert rejected["ok"], rejected
+
+    outcome = reg.promote("answer-style", created["version"], force=True)
+
+    assert not outcome["ok"]
+    assert "rejected" in outcome["error"]
+    assert "--force" in outcome["error"] or "even with" in outcome["error"]
+    assert not reg.active_skill_file("answer-style").exists()
+    assert reg.load_registry()["skills"]["answer-style"]["active_version"] == ""
+    assert reg.verify_consistency()["ok"], reg.verify_consistency()["problems"]
+
+
+def test_consistency_reports_active_file_without_registry_record(skill_workspace: Path):
+    path = reg.active_skill_file("orphan")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("---\nname: orphan\nversion: 0.1.0\n---\n\nbody\n", encoding="utf-8")
+
+    check = reg.verify_consistency()
+    assert not check["ok"]
+    assert any("no registry record" in problem for problem in check["problems"])
+
+
+def test_consistency_reports_champion_pointer_version_mismatch(skill_workspace: Path):
+    first = _candidate(skill_workspace, instructions="Champion one.")
+    reg.mark_champion("answer-style", first["version"], reason="test")
+    second = _candidate(skill_workspace, instructions="Champion two.")
+    (reg.champion_dir("answer-style") / "SKILL.md").write_text(
+        (reg.candidate_dir("answer-style", second["version"]) / "SKILL.md").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    check = reg.verify_consistency()
+    assert not check["ok"]
+    assert any("frontmatter version" in problem for problem in check["problems"])

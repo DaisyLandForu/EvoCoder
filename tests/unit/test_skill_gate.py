@@ -177,6 +177,23 @@ def test_hard_failure_outranks_insufficient_samples():
     assert decision["decision"] == DECISION_REJECT
 
 
+def test_infrastructure_failures_incubate_instead_of_counting_as_wins():
+    metrics = compute_paired_metrics(_pairs(both_pass=0, candidate_only=20), invalid_pairs=20)
+    decision = apply_gate(metrics, config=_permissive(), independent_judge=True)
+
+    assert metrics["paired_gain"] == 20
+    assert decision["decision"] == DECISION_INCUBATING
+    assert any("infrastructure failure" in reason for reason in decision["incubating_reasons"])
+
+
+def test_infrastructure_failures_outrank_metric_rejection():
+    metrics = compute_paired_metrics(_pairs(both_pass=18, champion_only=2), invalid_pairs=1)
+    decision = apply_gate(metrics, config=GateConfig(), independent_judge=True)
+
+    assert decision["decision"] == DECISION_INCUBATING
+    assert decision["blocking_reasons"] == []
+
+
 # --------------------------------------------------------------- configurability
 
 

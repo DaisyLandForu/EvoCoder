@@ -58,11 +58,16 @@ FORCED_TRANSITIONS = {(STATUS_CANDIDATE, STATUS_ACTIVE), (STATUS_SHADOW, STATUS_
 _RE_URL = re.compile(r"\b(?:https?://|www\.)\S+")
 _RE_EMAIL = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
 _RE_ISO_DATE = re.compile(r"\b\d{4}[-/]\d{1,2}[-/]\d{1,2}(?:[T ]\d{2}:\d{2}(?::\d{2})?Z?)?\b")
+_RE_US_DATE = re.compile(r"\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b")
 _RE_CN_DATE = re.compile(r"\b\d{4}\s*年\s*\d{1,2}\s*月(?:\s*\d{1,2}\s*日)?")
 _RE_SECRET = re.compile(
     r"\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{12,}|[A-Za-z0-9_-]{32,})\b"
 )
-_RE_ABS_PATH = re.compile(r"(?<![\w.])(?:/(?:home|Users|root|var|tmp|data)/[^\s,;:'\"`)]+)")
+_RE_UNIX_PATH = re.compile(
+    r"(?<![\w.])(/(?:etc|opt|usr|var|tmp|home|Users|root|data|mnt|media|srv|proc|sys|"
+    r"boot|dev|bin|sbin|lib|lib64)(?:/[^\s,;:'\"`)<>]+)?)"
+)
+_RE_WIN_PATH = re.compile(r"(?<![\w])(?:[A-Za-z]:\\[^\s,;:'\"`)<>]+|\\\\[^\s,;:'\"`)<>]+)")
 _RE_LONG_DIGITS = re.compile(r"\b\d{7,}\b")
 _RE_AT_HANDLE = re.compile(r"(?<![\w@])@[A-Za-z0-9_]{3,}\b")
 
@@ -70,8 +75,10 @@ _SANITIZE_RULES: tuple[tuple[str, re.Pattern[str], str], ...] = (
     ("email", _RE_EMAIL, "<redacted:email>"),
     ("secret", _RE_SECRET, "<redacted:secret>"),
     ("url", _RE_URL, "<redacted:url>"),
-    ("abs_path", _RE_ABS_PATH, "<redacted:path>"),
+    ("abs_path", _RE_UNIX_PATH, "<redacted:path>"),
+    ("abs_path", _RE_WIN_PATH, "<redacted:path>"),
     ("date", _RE_ISO_DATE, "<redacted:date>"),
+    ("date", _RE_US_DATE, "<redacted:date>"),
     ("date", _RE_CN_DATE, "<redacted:date>"),
     ("account", _RE_AT_HANDLE, "<redacted:account>"),
     ("identifier", _RE_LONG_DIGITS, "<redacted:number>"),
@@ -151,6 +158,14 @@ def candidate_dir(skill_name: str, version: str) -> Path:
 
 def champion_dir(skill_name: str) -> Path:
     return champions_root() / _safe_skill_slug(skill_name)
+
+
+def champion_version_dir(skill_name: str, version: str) -> Path:
+    return champion_dir(skill_name) / _safe_version(version)
+
+
+def champion_version_file(skill_name: str, version: str) -> Path:
+    return champion_version_dir(skill_name, version) / "SKILL.md"
 
 
 def active_skill_file(skill_name: str) -> Path:
@@ -512,6 +527,20 @@ def transition(
 
     node = _skill_node(registry, skill_name)
     if to_status == STATUS_CHAMPION:
+        previous = str(node.get("champion_version") or "")
+        if previous and previous != version:
+            previous_entry = node.get("versions", {}).get(previous)
+            if isinstance(previous_entry, dict) and previous_entry.get("status") == STATUS_CHAMPION:
+                previous_entry["status"] = STATUS_RETIRED
+                previous_entry["updated_at"] = _utc_now()
+                _record_history(
+                    previous_entry,
+                    from_status=STATUS_CHAMPION,
+                    to_status=STATUS_RETIRED,
+                    reason=f"superseded by {version}",
+                    actor=actor,
+                )
+                _sync_meta(skill_name, previous, previous_entry)
         node["champion_version"] = version
     save_registry(registry)
     _sync_meta(skill_name, version, entry)
@@ -524,26 +553,127 @@ def _sync_meta(skill_name: str, version: str, entry: dict[str, Any]) -> None:
         _atomic_write_json(target, entry)
 
 
+def _payload_matches_version(payload: str, *, skill_name: str, version: str, expected_hash: str = "") -> str:
+    """Return an error string if the file does not belong to the requested version."""
+    parsed = parse_skill_markdown(payload)
+    parsed_version = str(parsed.get("version") or "").strip()
+    if parsed_version != version:
+        return (
+            f"file frontmatter version {parsed_version or '(missing)'} does not match "
+            f"requested {skill_name}@{version}"
+        )
+    digest = content_hash(payload)
+    if expected_hash and digest != expected_hash:
+        return f"file hash {digest} does not match registry hash {expected_hash} for {skill_name}@{version}"
+    return ""
+
+
+def load_version_payload(skill_name: str, version: str, *, expected_hash: str = "") -> dict[str, Any]:
+    """Load the markdown for a specific version. Never trust the unversioned champion pointer."""
+    candidates = [
+        candidate_dir(skill_name, version) / "SKILL.md",
+        champion_version_file(skill_name, version),
+    ]
+    current = champion_dir(skill_name) / "SKILL.md"
+    errors: list[str] = []
+    for path in candidates:
+        if not path.is_file():
+            continue
+        payload = path.read_text(encoding="utf-8")
+        mismatch = _payload_matches_version(
+            payload, skill_name=skill_name, version=version, expected_hash=expected_hash
+        )
+        if mismatch:
+            errors.append(f"{path}: {mismatch}")
+            continue
+        return {"ok": True, "payload": payload, "path": path, "content_hash": content_hash(payload)}
+    if current.is_file():
+        payload = current.read_text(encoding="utf-8")
+        mismatch = _payload_matches_version(
+            payload, skill_name=skill_name, version=version, expected_hash=expected_hash
+        )
+        if not mismatch:
+            return {"ok": True, "payload": payload, "path": current, "content_hash": content_hash(payload)}
+        errors.append(f"{current}: {mismatch}")
+    if errors:
+        return {"ok": False, "error": errors[0]}
+    return {"ok": False, "error": f"no skill file found for {skill_name}@{version}"}
+
+
+def _promote_status_error(status: str, *, force: bool) -> str:
+    if status == STATUS_ACTIVE:
+        return "already active"
+    if status == STATUS_CHAMPION:
+        return ""
+    if status in {STATUS_CANDIDATE, STATUS_SHADOW}:
+        if force:
+            return ""
+        return (
+            f"status is '{status}'; only a gated champion can be promoted. "
+            "Run /skill-eval first, or pass --force to override a candidate/shadow explicitly."
+        )
+    if status == STATUS_REJECTED:
+        return "rejected versions cannot be activated, even with --force"
+    if status == STATUS_RETIRED:
+        return "retired versions can only be restored via /skill-rollback"
+    return f"illegal transition {status} -> {STATUS_ACTIVE}"
+
+
 def mark_champion(skill_name: str, version: str, *, reason: str, actor: str = "gate") -> dict[str, Any]:
-    """Copy a gated winner into champions/ and record the state change."""
+    """Copy a gated winner into a versioned champion slot, then update the current pointer.
+
+    Versioned files are written before the registry changes. The unversioned
+    `champions/<skill>/SKILL.md` pointer is updated last, so a crash cannot
+    advertise a champion that has no Gate evidence or no stored file.
+    """
     source = candidate_dir(skill_name, version) / "SKILL.md"
     if not source.is_file():
         return {"ok": False, "error": f"candidate file missing: {source}"}
-    entry = _version_entry(load_registry(), skill_name, version)
-    if entry is not None and str(entry.get("status") or "") == STATUS_CANDIDATE:
-        # A gate decision implies the version was evaluated, so record the shadow leg.
-        transition(skill_name, version, STATUS_SHADOW, reason=reason, actor=actor)
+    payload = source.read_text(encoding="utf-8")
+    registry = load_registry()
+    entry = _version_entry(registry, skill_name, version)
+    if entry is None:
+        return {"ok": False, "error": f"unknown version: {skill_name}@{version}"}
+    mismatch = _payload_matches_version(
+        payload,
+        skill_name=skill_name,
+        version=version,
+        expected_hash=str(entry.get("content_hash") or ""),
+    )
+    if mismatch:
+        return {"ok": False, "error": mismatch}
+
+    versioned = champion_version_file(skill_name, version)
+    versioned.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(versioned, payload)
+    _atomic_write_json(
+        versioned.parent / "meta.json",
+        {
+            "skill_name": skill_name,
+            "version": version,
+            "promoted_at": _utc_now(),
+            "reason": reason,
+            "content_hash": content_hash(payload),
+            "source_path": str(source),
+        },
+    )
+
+    if str(entry.get("status") or "") == STATUS_CANDIDATE:
+        shadowed = transition(skill_name, version, STATUS_SHADOW, reason=reason, actor=actor)
+        if not shadowed.get("ok"):
+            return shadowed
     result = transition(skill_name, version, STATUS_CHAMPION, reason=reason, actor=actor)
     if not result.get("ok"):
         return result
+
     target_dir = champion_dir(skill_name)
     target_dir.mkdir(parents=True, exist_ok=True)
-    atomic_write_text(target_dir / "SKILL.md", source.read_text(encoding="utf-8"))
+    atomic_write_text(target_dir / "SKILL.md", payload)
     _atomic_write_json(
         target_dir / "meta.json",
         {"skill_name": skill_name, "version": version, "promoted_at": _utc_now(), "reason": reason},
     )
-    return {**result, "champion_file": str(target_dir / "SKILL.md")}
+    return {**result, "champion_file": str(target_dir / "SKILL.md"), "versioned_file": str(versioned)}
 
 
 # ------------------------------------------------------------- promote / rollback
@@ -597,36 +727,36 @@ def promote(
     reason: str = "manual promote",
     force: bool = False,
 ) -> dict[str, Any]:
-    """Atomically activate a version, snapshotting whatever was active before."""
+    """Atomically activate a version, snapshotting whatever was active before.
+
+    Status, hash and frontmatter checks all run before the Active file is touched.
+    The payload is always the requested version's own file, never the current
+    champion pointer (which may belong to a newer winner).
+    """
     registry = load_registry()
     entry = _version_entry(registry, skill_name, version)
     if entry is None:
         return {"ok": False, "error": f"unknown version: {skill_name}@{version}"}
     status = str(entry.get("status") or "")
-    if status == STATUS_ACTIVE:
-        return {"ok": False, "error": f"{skill_name}@{version} is already active"}
-    if status != STATUS_CHAMPION and not force:
-        return {
-            "ok": False,
-            "error": (
-                f"{skill_name}@{version} is '{status}'; only a gated champion can be promoted. "
-                "Run /skill-eval first, or pass --force to override explicitly."
-            ),
-        }
+    status_error = _promote_status_error(status, force=force)
+    if status_error:
+        if status == STATUS_ACTIVE:
+            return {"ok": False, "error": f"{skill_name}@{version} is already active"}
+        return {"ok": False, "error": f"{skill_name}@{version} {status_error}"}
 
-    source = champion_dir(skill_name) / "SKILL.md"
-    if not source.is_file():
-        source = candidate_dir(skill_name, version) / "SKILL.md"
-    if not source.is_file():
-        return {"ok": False, "error": f"no skill file found for {skill_name}@{version}"}
-    payload = source.read_text(encoding="utf-8")
+    loaded = load_version_payload(
+        skill_name, version, expected_hash=str(entry.get("content_hash") or "")
+    )
+    if not loaded.get("ok"):
+        return loaded
+    payload = str(loaded["payload"])
 
     snapshot = _snapshot_active(skill_name, reason=f"pre-promote {version}")
     target = active_skill_file(skill_name)
     target.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(target, payload)
 
-    return _finalize_activation(
+    return _commit_activation(
         skill_name,
         version,
         actor=actor,
@@ -638,7 +768,7 @@ def promote(
     )
 
 
-def _finalize_activation(
+def _commit_activation(
     skill_name: str,
     version: str,
     *,
@@ -649,6 +779,11 @@ def _finalize_activation(
     target: Path,
     payload: str,
 ) -> dict[str, Any]:
+    """Update registry after the Active file has already been written.
+
+    Callers must have validated the transition. This function does not refuse
+    after the write; a programming error here is a crash, not a silent rollback.
+    """
     registry = load_registry()
     node = _skill_node(registry, skill_name)
     previous = str(node.get("active_version") or "")
@@ -680,11 +815,6 @@ def _finalize_activation(
     )
     current_status = str(entry.get("status") or STATUS_CANDIDATE)
     if current_status != STATUS_ACTIVE:
-        if (
-            STATUS_ACTIVE not in ALLOWED_TRANSITIONS.get(current_status, set())
-            or ((current_status, STATUS_ACTIVE) in FORCED_TRANSITIONS and not force)
-        ):
-            return {"ok": False, "error": f"illegal transition {current_status} -> {STATUS_ACTIVE}"}
         entry["status"] = STATUS_ACTIVE
         entry["updated_at"] = _utc_now()
         _record_history(
@@ -745,15 +875,30 @@ def rollback(
         if chosen is None:
             return {"ok": False, "error": f"no earlier healthy version to roll back to for {skill_name}"}
 
-    payload = (Path(chosen["dir"]) / "SKILL.md").read_text(encoding="utf-8")
     restored_version = str(chosen.get("version") or "") or "0.0.0"
+    payload = (Path(chosen["dir"]) / "SKILL.md").read_text(encoding="utf-8")
+    mismatch = _payload_matches_version(payload, skill_name=skill_name, version=restored_version)
+    if mismatch:
+        return {"ok": False, "error": mismatch}
+
+    restored_entry = _version_entry(registry, skill_name, restored_version)
+    restored_status = str((restored_entry or {}).get("status") or STATUS_RETIRED)
+    if restored_status == STATUS_REJECTED:
+        return {"ok": False, "error": f"{skill_name}@{restored_version} is rejected and cannot be restored"}
+    if restored_status == STATUS_ACTIVE:
+        return {"ok": False, "error": f"{skill_name}@{restored_version} is already active"}
+    if STATUS_ACTIVE not in ALLOWED_TRANSITIONS.get(restored_status, set()):
+        return {
+            "ok": False,
+            "error": f"illegal transition {restored_status} -> {STATUS_ACTIVE}",
+        }
 
     pre = _snapshot_active(skill_name, reason=f"pre-rollback to {restored_version}")
     target = active_skill_file(skill_name)
     target.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(target, payload)
 
-    result = _finalize_activation(
+    result = _commit_activation(
         skill_name,
         restored_version,
         actor=actor,
@@ -769,38 +914,93 @@ def rollback(
 # ------------------------------------------------------------------- consistency
 
 
+def _file_identity_problems(skill_name: str, path: Path, *, expected_version: str, expected_hash: str) -> list[str]:
+    if not path.is_file():
+        return [f"{skill_name}: missing file at {path}"]
+    payload = path.read_text(encoding="utf-8")
+    parsed = parse_skill_markdown(payload)
+    problems: list[str] = []
+    parsed_version = str(parsed.get("version") or "").strip()
+    if expected_version and parsed_version != expected_version:
+        problems.append(
+            f"{skill_name}: {path} frontmatter version {parsed_version or '(missing)'} "
+            f"!= registry version {expected_version}"
+        )
+    digest = content_hash(payload)
+    if expected_hash and digest != expected_hash:
+        problems.append(f"{skill_name}: {path} hash differs from registry record")
+    return problems
+
+
 def verify_consistency() -> dict[str, Any]:
-    """Check that registry, active files and champion copies agree."""
+    """Check that registry, active files and champion copies agree on version and hash."""
     registry = load_registry()
     problems: list[str] = []
-    for skill_name, node in registry.get("skills", {}).items():
+    skills = registry.get("skills", {}) if isinstance(registry.get("skills"), dict) else {}
+
+    for skill_name, node in skills.items():
         if not isinstance(node, dict):
             problems.append(f"{skill_name}: malformed registry node")
             continue
+        versions = node.get("versions", {}) if isinstance(node.get("versions"), dict) else {}
         active_version = str(node.get("active_version") or "")
         path = active_skill_file(skill_name)
         if active_version:
-            if not path.is_file():
-                problems.append(f"{skill_name}: active version {active_version} has no file at {path}")
-            else:
-                entry = node.get("versions", {}).get(active_version)
-                digest = content_hash(path.read_text(encoding="utf-8"))
-                if isinstance(entry, dict) and entry.get("content_hash") not in {None, "", digest}:
-                    problems.append(f"{skill_name}: active file hash differs from registry record")
-                if isinstance(entry, dict) and entry.get("status") != STATUS_ACTIVE:
-                    problems.append(
-                        f"{skill_name}: active_version {active_version} has status {entry.get('status')}"
-                    )
+            entry = versions.get(active_version)
+            expected_hash = str((entry or {}).get("content_hash") or "") if isinstance(entry, dict) else ""
+            problems.extend(
+                _file_identity_problems(
+                    skill_name, path, expected_version=active_version, expected_hash=expected_hash
+                )
+            )
+            if isinstance(entry, dict) and entry.get("status") != STATUS_ACTIVE:
+                problems.append(
+                    f"{skill_name}: active_version {active_version} has status {entry.get('status')}"
+                )
         actives = [
             version
-            for version, entry in node.get("versions", {}).items()
+            for version, entry in versions.items()
             if isinstance(entry, dict) and entry.get("status") == STATUS_ACTIVE
         ]
         if len(actives) > 1:
             problems.append(f"{skill_name}: {len(actives)} versions marked active")
         champion_version = str(node.get("champion_version") or "")
-        if champion_version and not (champion_dir(skill_name) / "SKILL.md").is_file():
-            problems.append(f"{skill_name}: champion {champion_version} has no stored file")
+        if champion_version:
+            entry = versions.get(champion_version)
+            expected_hash = str((entry or {}).get("content_hash") or "") if isinstance(entry, dict) else ""
+            current = champion_dir(skill_name) / "SKILL.md"
+            versioned = champion_version_file(skill_name, champion_version)
+            if not current.is_file() and not versioned.is_file():
+                problems.append(f"{skill_name}: champion {champion_version} has no stored file")
+            else:
+                if current.is_file():
+                    problems.extend(
+                        _file_identity_problems(
+                            skill_name,
+                            current,
+                            expected_version=champion_version,
+                            expected_hash=expected_hash,
+                        )
+                    )
+                if versioned.is_file():
+                    problems.extend(
+                        _file_identity_problems(
+                            skill_name,
+                            versioned,
+                            expected_version=champion_version,
+                            expected_hash=expected_hash,
+                        )
+                    )
+
+    root = active_skills_root()
+    if root.is_dir():
+        for skill_md in sorted(root.glob("*/SKILL.md")):
+            parsed = parse_skill_markdown(skill_md.read_text(encoding="utf-8"))
+            name = str(parsed.get("name") or skill_md.parent.name).strip()
+            node = skills.get(name)
+            if not isinstance(node, dict) or not str(node.get("active_version") or ""):
+                problems.append(f"{name}: active file {skill_md} has no registry record")
+
     return {"ok": not problems, "problems": problems}
 
 

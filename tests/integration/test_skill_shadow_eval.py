@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from agents import skill_registry as reg
 from agents.skill_gate import DECISION_INCUBATING, DECISION_PROMOTE, DECISION_REJECT, GateConfig
 from agents.skill_shadow_eval import (
@@ -208,7 +209,33 @@ async def test_paired_differences_are_reported_per_sample(skill_workspace: Path)
     assert artifact["metrics"]["gate"]["paired_gain"] == 3
 
 
-async def test_a_generation_failure_counts_as_a_hard_failure(skill_workspace: Path):
+async def test_champion_generation_failure_does_not_count_as_a_candidate_win(skill_workspace: Path):
+    version = _seed_skill(champion_instructions="Cite sources.", candidate_instructions="Always cite sources.")
+
+    async def _generate(request: GenerationRequest) -> GenerationResult:
+        if request.arm == ARM_CHAMPION:
+            raise RuntimeError("champion backend down")
+        return GenerationResult(text="see https://a", input_tokens=10, output_tokens=10)
+
+    artifact = await run_paired_evaluation(
+        skill_name=SKILL,
+        candidate_version=version,
+        generate=_generate,
+        generation_config=_config(),
+        judge_config=_judge_config(independent=True),
+        gate_config=_permissive_gate(),
+        samples=_samples(20),
+    )
+
+    assert artifact["metrics"]["gate"]["invalid_pairs"] == 20
+    assert artifact["metrics"]["gate"]["paired_samples"] == 0
+    assert artifact["metrics"]["gate"]["paired_gain"] == 0
+    assert artifact["metrics"]["gate"]["candidate_hard_failures"] == 0
+    assert artifact["gate"]["decision"] == DECISION_INCUBATING
+    assert reg.load_registry()["skills"][SKILL]["versions"][version]["status"] == reg.STATUS_SHADOW
+
+
+async def test_a_generation_failure_invalidates_the_pair(skill_workspace: Path):
     version = _seed_skill(champion_instructions="Cite sources.", candidate_instructions="Always cite sources.")
 
     async def _generate(request: GenerationRequest) -> GenerationResult:
@@ -226,8 +253,10 @@ async def test_a_generation_failure_counts_as_a_hard_failure(skill_workspace: Pa
         samples=_samples(2),
     )
 
-    assert artifact["metrics"]["gate"]["candidate_hard_failures"] == 2
-    assert artifact["gate"]["decision"] == DECISION_REJECT
+    assert artifact["metrics"]["gate"]["invalid_pairs"] == 2
+    assert artifact["metrics"]["gate"]["candidate_hard_failures"] == 0
+    assert artifact["gate"]["decision"] == DECISION_INCUBATING
+    assert all(not sample["valid"] for sample in artifact["samples"])
 
 
 # ------------------------------------------------- P1.4 replay / holdout isolation
@@ -512,3 +541,38 @@ async def test_full_lifecycle_from_candidate_to_rollback(skill_workspace: Path):
     assert rolled_back["ok"], rolled_back
     assert "Always cite sources." not in reg.active_skill_file(SKILL).read_text(encoding="utf-8")
     assert reg.verify_consistency()["ok"]
+
+
+async def test_artifact_write_failure_does_not_create_a_champion(skill_workspace: Path, monkeypatch):
+    import agents.skill_shadow_eval as eval_mod
+
+    version = _seed_skill(champion_instructions="Cite sources.", candidate_instructions="Always cite sources.")
+    real_write = eval_mod.atomic_write_text
+
+    def _boom(path: Path, text: str) -> None:
+        if "evaluations" in Path(path).parts:
+            raise OSError("simulated evaluation artifact write failure")
+        return real_write(path, text)
+
+    monkeypatch.setattr(eval_mod, "atomic_write_text", _boom)
+
+    with pytest.raises(OSError, match="evaluation artifact"):
+        await run_paired_evaluation(
+            skill_name=SKILL,
+            candidate_version=version,
+            generate=_arm_generator(
+                {ARM_NO_SKILL: "plain", ARM_CHAMPION: "plain", ARM_CANDIDATE: "see https://b"}
+            ),
+            generation_config=_config(),
+            judge_config=_judge_config(independent=True),
+            gate_config=_permissive_gate(),
+            samples=_samples(3),
+        )
+
+    entry = reg.load_registry()["skills"][SKILL]["versions"][version]
+    assert entry["status"] == reg.STATUS_SHADOW
+    assert not list(reg.evaluations_root().rglob("*.json"))
+    assert not (reg.champion_dir(SKILL) / "meta.json").exists() or (
+        json.loads((reg.champion_dir(SKILL) / "meta.json").read_text(encoding="utf-8")).get("version")
+        != version
+    )

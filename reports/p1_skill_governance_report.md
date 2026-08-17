@@ -90,7 +90,7 @@ NTR = `#(Champion 通过而 Candidate 失败) / #(Champion 通过)`；Champion �
 沙箱内 `evocoder-sandbox:latest` 执行结果：
 
 ```text
-170 passed in 3.36s
+171 passed in 3.36s
 ```
 
 | 测试文件 | 用例数 | 覆盖的验收标准 |
@@ -129,7 +129,23 @@ Ruff：新增的 `agents/skill_registry.py`、`agents/skill_gate.py`、`agents/s
 
 - 分支：`refactor/evocoder-runtime-v2`
 - 起始 Commit：`77357d1`
-- 本阶段 Commit：`feat(p1): add gated skill evolution lifecycle`
+- 本阶段 Commit：`feat(p1): add gated skill evolution lifecycle`（`0888903`）；审查返工见第 9 节
 - 新增文件：`agents/skill_registry.py`、`agents/skill_gate.py`、`agents/skill_rules.py`、`agents/skill_shadow_eval.py`、5 个测试文件、本报告
 - 删除文件：`agents/online_skill_eval.py`
 - 修改文件：`agents/main.py`、`agents/online_skill_evolution.py`、`agents/skill_evolution.py`、`tests/conftest.py`、`README.md`
+
+## 9. 审查返工：Gate 可靠性与版本—内容一致性
+
+针对 `0888903` 的 4 个阻断项与脱敏缺口。返工后宿主机 `180 passed in 3.05s`；P1 新增范围 Ruff 通过。
+
+| 阻断项 | 根因 | 修复 | 新增 / 改写测试 |
+|--------|------|------|-----------------|
+| Champion 生成失败被计为 Candidate 胜利 | 生成异常写进 `hard_failed`/`passed`，仍作为有效 pair 参与 Gate | 区分 `infrastructure_error` 与行为失败；任一臂超时/异常/Judge 故障则该 pair 无效；`invalid_pairs > 0` 时 Gate 只能 `incubating` | `test_champion_generation_failure_does_not_count_as_a_candidate_win`、`test_a_generation_failure_invalidates_the_pair`、`test_infrastructure_failures_incubate_instead_of_counting_as_wins` |
+| 激活版本与文件内容不一致 | `promote()` 优先读未版本化的 `champions/<skill>/SKILL.md`；新 Champion 不退休旧 Champion | 按 `candidates/<ver>` 或 `champions/<skill>/<ver>` 取文件；校验 frontmatter version 与 registry hash；新 Champion 将仍为 `champion` 的旧版本标为 `retired`；一致性检查比对 Champion 内容 | `test_promote_loads_the_requested_version_not_the_current_pointer`、`test_new_champion_retires_the_previous_champion`、`test_consistency_reports_champion_pointer_version_mismatch` |
+| rejected + `--force` 仍把内容写上线 | 先写 Active，再在 `_finalize_activation` 里拒绝非法迁移 | 状态/哈希/版本检查全部在写盘前完成；`--force` 只放开 candidate/shadow；rejected 即使 force 也拒绝；一致性检查扫描无 registry 记录的 Active 文件 | `test_rejected_force_promote_does_not_write_active`、`test_consistency_reports_active_file_without_registry_record` |
+| Gate 先改状态、评测证据后落盘 | `mark_champion()` 发生在 artifact `atomic_write_text` 之前 | 先持久化带 Gate 摘要的评测产物，成功后再提交生命周期；`mark_champion` 先写版本化 Champion 文件，再改 registry，最后更新当前指针 | `test_artifact_write_failure_does_not_create_a_champion` |
+
+脱敏补强：Unix 路径覆盖 `/etc`、`/opt` 等常见根，并识别 Windows 盘符路径与 UNC；日期增加 `11/03/2024` 这类月日年格式。
+
+当前 P1 测试规模：`test_skill_registry.py` 23、`test_skill_gate.py` 19、`test_skill_cli.py` 5、`test_skill_shadow_eval.py` 22、`test_online_candidate_isolation.py` 8。
+
