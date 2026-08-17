@@ -6,16 +6,16 @@ Bear Agent 是一个基于 Python 实现的 **自进化 Harness Agent**。它不
 
 ## 核心亮点
 
-- **自进化 Harness Agent**：从用户反馈中自动抽取可复用规则，新增或合并到 `SKILL.md`，让 Agent 能随着使用持续沉淀能力。
-- **完整 Agent Loop**：模型请求、tool call 解析、权限检查、工具执行、tool result 回写、继续推理、会话保存形成闭环。
+- **自进化 Harness Agent**：从用户反馈中抽取可复用规则，但在线链路只写入 Candidate；必须经过 Shadow 评测和 Gate，再由 `/skill-promote` 原子激活 Active。
+- **完整 Agent Loop**：模型请求、tool call 解析、策略授权、工具调度、tool result 回写、继续推理、Trace 收口、会话保存形成闭环。
 - **OpenAI / Anthropic 双协议**：支持 OpenAI-compatible 和 Anthropic-compatible 接口，便于接入不同模型服务或代理网关。
-- **工具系统与权限控制**：支持读写文件、精确编辑、代码搜索、Shell 命令、Skill 调用、子 Agent 和 MCP 工具；Plan Mode 下阻断写操作和 Shell。
+- **工具系统与权限控制**：`PolicyEngine` 按路径边界 → deny → Plan Mode → MCP 信任 → allow → bypass → 确认矩阵判定；子 Agent / Skill fork 的权限只能降不能升。Plan Mode 有独立状态机，审批 `await` 计划正文。
 - **Skills 体系**：通过项目级和用户级 `SKILL.md` 保存可复用任务方法，支持检索、调用、inline / fork 执行和版本化演化。
 - **长期 Memory**：按项目路径 hash 隔离记忆，保存用户偏好、项目背景、历史决策和参考资料。
 - **MCP 外部工具扩展**：自研 stdio JSON-RPC MCP Client，把外部 MCP Server 工具包装为 `mcp__server__tool`。
 - **子 Agent**：支持 `explore`、`plan`、`general` 以及自定义子 Agent，用隔离上下文完成探索、规划或局部任务。
 - **会话恢复和上下文压缩**：自动保存 session，支持 `--resume`、`/compact`，并对大工具结果做截断或持久化。
-- **事件级 Trace 与可复现评测**：每次运行写入 JSONL 轨迹；`benchmarks/` 用冻结配置重跑小规模软件工程任务，CI 不依赖真实 API Key。
+- **事件级 Trace 与可复现评测**：每次根 `chat()` 新 `run_id`；REPL 治理命令走独立 Trace；未知 usage 成本为 `null`，设了 `max_cost` 则保守停止。`benchmarks/` 用冻结配置重跑 `software-engineering-mini-v1`，CI 不依赖真实 API Key。
 
 ## 项目架构
 
@@ -26,15 +26,18 @@ Bear Agent 是一个基于 Python 实现的 **自进化 Harness Agent**。它不
 ```text
 用户输入
   -> agents/main.py
-  -> Agent.chat()
+  -> Agent.chat() 打开 run_start
   -> 构建 Prompt / 检索 Skills / 预取 Memory / 初始化 MCP
   -> 调用 OpenAI-compatible 或 Anthropic-compatible 模型
   -> 模型返回文本或 tool call
-  -> Harness 做权限检查
-  -> 执行工具 / Skill / MCP / 子 Agent
+  -> ToolCallScheduler 切段：连续只读可并发，副作用是屏障
+  -> PolicyEngine 授权
+  -> 执行工具 / Skill / MCP / 子 Agent（共享 BudgetTracker）
   -> tool result 回写模型
+  -> drain Skill 后台任务与 Memory 预取
+  -> run_finished（本 run 增量）后 unbind Trace
   -> 保存 Session
-  -> 后台执行 Skill usage tracking 和 online skill evolution
+  -> 在线抽取只写入 Candidate，不改 Active
 ```
 
 ## 目录结构
@@ -43,26 +46,33 @@ Bear Agent 是一个基于 Python 实现的 **自进化 Harness Agent**。它不
 BearAgent/
 ├── agents/
 │   ├── main.py                    # CLI 入口、REPL、参数解析
-│   ├── agent.py                   # Agent Runtime、模型调用、工具调度、上下文压缩
-│   ├── tools.py                   # 内置工具和权限系统
-│   ├── prompt.py                  # System prompt 动态构建
-│   ├── skills.py                  # Skills 加载、检索、执行、创建和演化封装
-│   ├── online_skill_evolution.py  # 在线 Skill 抽取和 add/merge/discard 决策
-│   ├── skill_evolution.py         # Skill 落盘、版本快照、审计统计
-│   ├── memory.py                  # 长期记忆系统
-│   ├── skill_registry.py          # Skill 六态、Candidate 隔离、Promote/Rollback
+│   ├── agent.py                   # Agent Runtime、模型调用、工具调度、Trace 生命周期
+│   ├── runtime_config.py          # RuntimeConfig、共享 BudgetTracker、子配置降权
+│   ├── policy.py                  # PolicyEngine：路径 / deny / Plan / MCP 信任 / 确认
+│   ├── plan_mode.py               # Plan Mode 状态机，审批 await 计划正文
+│   ├── tool_scheduler.py          # 按模型顺序切段；连续只读可并发
+│   ├── tools.py                   # 内置工具执行
+│   ├── prompt.py                  # System prompt；memory_enabled=false 时不注入 Memory Index
+│   ├── skills.py                  # Skills 加载、检索、执行
+│   ├── online_skill_evolution.py  # 在线抽取；add/merge 只写 Candidate
+│   ├── skill_evolution.py         # 手工 create/evolve Active、旧审计
+│   ├── skill_registry.py          # 六态、Candidate 隔离、Promote/Rollback
 │   ├── skill_shadow_eval.py       # 三臂成对 Shadow 评测
 │   ├── skill_gate.py              # NTR / 收益 / 成本 Gate
-│   ├── trace.py                   # 事件级 JSONL Trace
+│   ├── skill_rules.py             # 三臂共用规则编译
+│   ├── trace.py                   # 事件级 JSONL Trace、脱敏、图校验
+│   ├── memory.py                  # 长期记忆系统
+│   ├── session_memory.py          # 三层折叠 schema
 │   ├── mcp_client.py              # MCP stdio JSON-RPC 客户端
 │   ├── subagent.py                # 子 Agent 配置
 │   ├── session.py                 # 会话保存与恢复
 │   └── ui.py                      # 终端 UI 输出
 ├── benchmarks/                    # 可复现评测：configs / tasks / runner / manifests
+├── tests/                         # unit / integration；需在 evocoder-sandbox 中跑
 ├── .github/workflows/ci.yml       # ruff check + pytest -q
 ├── .bear/
-│   ├── skills/                    # 项目级 Skills
-│   └── skill-evolution/           # Skills 自进化审计产物
+│   ├── skills/                    # 项目级 Active Skills
+│   └── skill-evolution/           # Candidate / Champion / snapshots / evaluations
 ├── wiki/                          # 项目文档中心
 ├── Dockerfile
 ├── requirements.txt
@@ -169,7 +179,9 @@ python3 -m agents.main --resume
 python3 -m agents.main --trace "fix the failing test"
 ```
 
-默认写入 `.bear/traces/<run_id>.jsonl`。事件包含 `run_id`、`session_id`、`step_id`、`parent_step_id`，覆盖模型请求、策略决定、工具、Memory、Skill 候选/评测和子 Agent。Prompt 默认只记 hash，不写 API Key。
+默认写入 `.bear/traces/<run_id>.jsonl`。事件包含 `run_id`、`session_id`、`step_id`、`parent_step_id`，覆盖模型请求、策略决定、工具、Memory、Skill 候选/评测和子 Agent。Prompt 默认只记 hash。脱敏覆盖 `x-api-key`、`proxy-authorization` 及 `-` / `_` / 大小写变体。
+
+未知 usage 不记成 0，`estimated_cost` 为 `null`；设置了 `--max-cost` 且存在未知 usage 时保守停止。Side Query 计入同一份 `BudgetTracker`。`/skill-eval`、`/compact`、`/extract_now` 各自打开独立 Trace run，结束后清空 Recorder，不会追加到已经结束的对话。
 
 可复现评测（脚本化模型，不需要真实 Key）：
 
@@ -181,7 +193,7 @@ python -m benchmarks.runner
 
 ## 如何让项目自动沉淀并进化 Skills
 
-Bear Code 的核心特色是 **自进化 Skills**。它可以从用户明确反馈中抽取未来可复用的规则，并自动新增或合并到项目级或用户级 `SKILL.md`。
+Bear Code 的核心特色是 **自进化 Skills**。它可以从用户明确反馈中抽取未来可复用的规则。在线链路只写入 `.bear/skill-evolution/candidates/`，**不会直接改 Active**。Active 仍在 `.bear/skills/<skill>/SKILL.md`，只能由 `/skill-promote` 或 `/skill-rollback` 写入。`/skill-create` 与 `/skill-evolve` 是手工命令，仍直接写 Active，不属于自动反馈链路。
 
 ### 1. 开启自动自进化
 
@@ -195,7 +207,7 @@ BEAR_AUTO_SKILL_TARGET=project
 含义：
 
 - `BEAR_AUTO_SKILL_EVOLUTION=1`：启用在线 Skill 自进化。
-- `BEAR_AUTO_SKILL_TARGET=project`：自动新增的 Skill 写入当前项目 `.bear/skills/`。
+- `BEAR_AUTO_SKILL_TARGET=project`：自动抽取的 Candidate 写入当前项目 `.bear/skill-evolution/candidates/`。
 
 如果希望沉淀为所有项目共享的个人 Skill：
 
@@ -212,7 +224,7 @@ user:    ~/.bear/skills/<skill_name>/SKILL.md
 
 ### 2. 用允许写入的权限模式启动
 
-后台自动写入 Skill 需要当前权限模式允许写文件。推荐使用：
+后台写入 Candidate 需要当前权限模式允许写文件。推荐使用：
 
 ```bash
 BEAR_AUTO_SKILL_EVOLUTION=1 \
@@ -226,7 +238,7 @@ python3 -m agents.main --accept-edits
 python3 -m agents.main --yolo
 ```
 
-不建议长期默认使用 `--yolo`，因为它会跳过确认。日常推荐 `--accept-edits`，既能让后台 Skill 写入正常发生，又不会绕过所有权限判断。
+不建议长期默认使用 `--yolo`，因为它会跳过确认。日常推荐 `--accept-edits`，既能让后台 Candidate 写入正常发生，又不会绕过所有权限判断。Active 仍不会被在线链路改写。
 
 ### 3. 给出可复用反馈
 
@@ -261,9 +273,12 @@ python3 -m agents.main --yolo
   -> online_ingest()
   -> Extractor 抽取候选 Skill
   -> Maintainer 判断 add / merge / discard
-  -> create_skill_file() 或 evolve_skill_file()
-  -> 写入 SKILL.md
-  -> 记录 provenance、usage stats 和版本快照
+  -> add / merge 写入 Candidate（不改 Active）
+  -> /skill-eval 三臂 Shadow 评测
+  -> Gate（NTR / 收益 / 成本 / 硬失败 / Holdout / 独立 Judge）
+  -> 通过后 mark Champion
+  -> /skill-promote 原子激活 Active
+  -> 需要时 /skill-rollback
 ```
 
 核心文件：
@@ -271,20 +286,13 @@ python3 -m agents.main --yolo
 ```text
 agents/agent.py
 agents/online_skill_evolution.py
-agents/skills.py
-agents/skill_evolution.py
+agents/skill_registry.py
+agents/skill_shadow_eval.py
+agents/skill_gate.py
+agents/skill_rules.py
 ```
 
-审计产物：
-
-```text
-.bear/skill-evolution/usage.jsonl
-.bear/skill-evolution/online_provenance.jsonl
-.bear/skill-evolution/online_skill_provenance.json
-.bear/skill-evolution/skill_usage_stats.json
-.bear/skill-evolution/history/
-.bear/skill-evolution/pruned/
-```
+审计产物见下方「Skill 演化治理」。旧的 `usage.jsonl` / `history/` 仍保留给手工 create/evolve。
 
 ### 5. 手动触发当前窗口抽取
 
@@ -328,7 +336,8 @@ agents/skill_evolution.py
 | `--yolo`, `-y` | 跳过确认 |
 | `--dont-ask` | 自动拒绝需要确认的操作，适合 CI |
 | `--resume` | 恢复最近会话 |
-| `--max-cost` | 费用上限 |
+| `--trace` | 写入事件级 JSONL Trace |
+| `--max-cost` | 费用上限；未知 usage 时保守停止 |
 | `--max-turns` | 最大 agentic turns |
 
 ### REPL 命令
@@ -338,18 +347,18 @@ agents/skill_evolution.py
 | `/clear` | 清空对话历史 |
 | `/plan` | 切换 Plan Mode |
 | `/cost` | 显示 token 和费用估算 |
-| `/compact` | 手动压缩上下文 |
+| `/compact` | 手动压缩上下文；独立 Trace run |
 | `/memory` | 列出长期记忆 |
 | `/skills` | 列出可用 Skills |
 | `/skill-stats` | 查看 Skill 使用和演化统计 |
 | `/skill-status` | 查看 Candidate / Champion / Active 生命周期状态 |
-| `/skill-eval <skill> [version]` | 三组重新生成的成对影子评测 |
+| `/skill-eval <skill> [version]` | 三组重新生成的成对影子评测；独立 Trace run |
 | `/skill-promote <skill> <version> [--force]` | 把通过 Gate 的 Champion 原子激活为 Active |
 | `/skill-rollback <skill> [version]` | 回滚到指定版本或上一个健康版本 |
-| `/extract_now [hint]` | 抽取当前 pending window |
+| `/extract_now [hint]` | 抽取当前 pending window；独立 Trace run |
 | `/skill-feedback <skill> <rating> [note]` | 记录 Skill 反馈 |
-| `/skill-evolve <skill> <lesson>` | 手动演化 Skill |
-| `/skill-create <name> \| <description> \| <when-to-use> \| <instructions>` | 手动创建 Skill |
+| `/skill-evolve <skill> <lesson>` | 手工演化 Active，不属于自动反馈链路 |
+| `/skill-create <name> \| <description> \| <when-to-use> \| <instructions>` | 手工创建 Active，不属于自动反馈链路 |
 
 ## Skill 演化治理（Candidate → Champion → Active）
 
@@ -441,6 +450,14 @@ Bear Code 支持 MCP 外部工具扩展。MCP Server 可以通过 stdio JSON-RPC
 }
 ```
 
+仓库级 MCP 配置（`.mcp.json`、`.bear/settings.json`）必须先被用户信任才会启动 Server。信任记录写在用户目录，**不会进仓库**：
+
+```text
+~/.bear/mcp-trust/<workspace_id>.json
+```
+
+可用环境变量 `BEAR_MCP_TRUSTED=1` 跳过该项（仅适合受控环境）。克隆下来的仓库不会因为提交了信任文件而预信任。
+
 工具命名规则：
 
 ```text
@@ -466,7 +483,7 @@ docker run --rm -it \
   bear-code
 ```
 
-允许自动沉淀 Skills：
+允许自动抽取 Candidate（仍不会改 Active）：
 
 ```bash
 docker run --rm -it \
@@ -483,13 +500,16 @@ docker run --rm -it \
 
 | 数据 | 路径 |
 |------|------|
-| 项目级 Skills | `.bear/skills/<skill_name>/SKILL.md` |
+| 项目级 Active Skills | `.bear/skills/<skill_name>/SKILL.md` |
 | 用户级 Skills | `~/.bear/skills/<skill_name>/SKILL.md` |
-| Skills 自进化审计 | `.bear/skill-evolution/` |
+| Candidate / Champion / 评测 | `.bear/skill-evolution/` |
+| 事件级 Trace | `.bear/traces/<run_id>.jsonl` |
+| MCP 信任 | `~/.bear/mcp-trust/<workspace_id>.json` |
 | 长期记忆 | `~/.BearCode/projects/<project_hash>/memory/` |
 | 会话历史 | `~/.bear-code/sessions/` |
 | 大工具结果 | `~/.bear-code/tool-results/` |
 | Plan Mode 计划 | `~/.bear/plans/` |
+| 可复现评测产物 | `runs/<run_id>/` |
 
 ## 文档入口
 
@@ -499,9 +519,8 @@ docker run --rm -it \
 |------|------|
 | [学习说明](wiki/从0到1学习了解项目.md) | 面向学习者的完整项目说明 |
 | [架构设计](wiki/架构设计.md) | 系统分层、主链路、模块边界和数据流 |
-| [核心源码阅读指南](wiki/核心源码阅读指南.md) | 按源码顺序学习 Agent Loop、工具、Skills、Memory、MCP 和自进化 |
+| [评测部分](wiki/评测部分.md) | 当前 `benchmarks/` 口径与历史 GAIA/HLE 未验证分数 |
 | [技术亮点](wiki/技术亮点.md) | 技术亮点和核心代码讲解 |
-| [Skills 自进化逻辑](wiki/Skills自进化逻辑与实现思路.md) | 自进化设计和实现取舍 |
 | [简历包装](wiki/简历包装.md) | 简历 bullet、面试表达和项目包装 |
 
 ## 适合如何使用
