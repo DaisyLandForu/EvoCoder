@@ -483,7 +483,14 @@ def record_skill_usage_judgments(judgments: list[dict[str, Any]]) -> dict[str, A
     return {"ok": True, "judgments": len(judgments), "pruned": pruned}
 
 
+def _auto_archive_allowed() -> bool:
+    """Moving a user's skill directory needs an explicit opt-in, never a silent default."""
+    return os.environ.get("BEAR_SKILL_AUTO_ARCHIVE", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _maybe_prune_stale_skill(skill_name: str, stats: dict[str, Any]) -> bool:
+    if not _auto_archive_allowed():
+        return False
     min_retrieved = _parse_int(os.environ.get("BEAR_SKILL_USAGE_PRUNE_MIN_RETRIEVED"), 40)
     max_used = _parse_int(os.environ.get("BEAR_SKILL_USAGE_PRUNE_MAX_USED"), 0)
     source = str(stats.get("source") or "").strip().lower()

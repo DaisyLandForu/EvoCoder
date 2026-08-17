@@ -37,7 +37,52 @@ from .skills import (
     record_feedback,
     skill_stats,
 )
-from .online_skill_eval import format_online_skill_eval_async
+from .skill_registry import promote as promote_skill_version
+from .skill_registry import rollback as rollback_skill_version
+from .skill_registry import skill_status_report
+from .skill_shadow_eval import (
+    GenerationConfig,
+    JudgeConfig,
+    format_evaluation_summary,
+    make_side_query_generator,
+    run_paired_evaluation,
+)
+
+
+async def _run_skill_eval(agent, skill_name: str, version: str = "") -> str:
+    """Run a paired shadow evaluation from the REPL.
+
+    Generator and judge share the session model here, so the judge is marked
+    non-independent and the gate can only ever return `incubating`.
+    """
+    config = getattr(agent, "config", None)
+    generation = GenerationConfig(
+        model=str(getattr(config, "model", "") or "unknown"),
+        provider=str(getattr(config, "provider", "") or "unknown"),
+        temperature=0.0,
+        max_output_tokens=2400,
+        timeout_s=float(getattr(config, "model_timeout_s", 120.0) or 120.0),
+        seed=None,
+        tools=(),
+        enforced_by="side_query",
+    )
+    judge = JudgeConfig(
+        model=generation.model,
+        provider=generation.provider,
+        temperature=0.0,
+        seed=None,
+        blinded=True,
+    )
+    side_query = agent._build_side_query(max_tokens=2400)
+    artifact = await run_paired_evaluation(
+        skill_name=skill_name,
+        candidate_version=version,
+        generate=make_side_query_generator(side_query),
+        judge=side_query,
+        generation_config=generation,
+        judge_config=judge,
+    )
+    return format_evaluation_summary(artifact)
 
 
 def parse_args() -> argparse.Namespace:
@@ -232,9 +277,46 @@ async def run_repl(agent: Agent) -> None:
         if inp == "/skill-stats":
             print_info(skill_stats())
             continue
-        if inp == "/skill-eval":
-            side_query = agent._build_side_query(max_tokens=2400)
-            print_info(await format_online_skill_eval_async(side_query=side_query))
+        if inp == "/skill-status":
+            print_info(skill_status_report())
+            continue
+        if inp.startswith("/skill-eval"):
+            skill_name = inp[len("/skill-eval") :].strip()
+            if not skill_name:
+                print_error("Usage: /skill-eval <skill-name> [candidate-version]")
+                continue
+            parts = skill_name.split()
+            print_info(await _run_skill_eval(agent, parts[0], parts[1] if len(parts) > 1 else ""))
+            continue
+        if inp.startswith("/skill-promote "):
+            parts = inp[len("/skill-promote ") :].strip().split()
+            force = "--force" in parts
+            parts = [part for part in parts if part != "--force"]
+            if len(parts) < 2:
+                print_error("Usage: /skill-promote <skill-name> <version> [--force]")
+                continue
+            result = promote_skill_version(parts[0], parts[1], actor="user", force=force)
+            if result.get("ok"):
+                print_info(
+                    f"Activated {parts[0]}@{parts[1]} -> {result.get('file')}"
+                    + (f" (snapshot: {result['snapshot']})" if result.get("snapshot") else "")
+                    + (" [forced]" if result.get("forced") else "")
+                )
+            else:
+                print_error(str(result.get("error") or result))
+            continue
+        if inp.startswith("/skill-rollback "):
+            parts = inp[len("/skill-rollback ") :].strip().split()
+            if not parts:
+                print_error("Usage: /skill-rollback <skill-name> [version]")
+                continue
+            result = rollback_skill_version(parts[0], parts[1] if len(parts) > 1 else "", actor="user")
+            if result.get("ok"):
+                print_info(
+                    f"Rolled {parts[0]} back to {result.get('version')} at {result.get('file')}"
+                )
+            else:
+                print_error(str(result.get("error") or result))
             continue
         if inp.startswith("/extract_now"):
             hint = inp[len("/extract_now") :].strip()
@@ -324,15 +406,8 @@ async def run_one_shot(agent: Agent, prompt: str) -> None:
     await agent.drain_background_skill_tasks()
 
 
-def main() -> None:
-    """CLI 程序入口：准备运行配置，创建 Agent，并按参数选择一次性执行或交互模式。"""
-    # 解析命令行参数，例如 --plan、--resume、--model，以及可选的一次性 prompt。
-    args = parse_args()
-    _load_env_file()
-
-    if args.help:
-        # 自定义帮助文本，展示 Bear Code 支持的启动参数和 REPL 内置命令。
-        print("""
+# 自定义帮助文本，展示 Bear Code 支持的启动参数和 REPL 内置命令。
+HELP_TEXT = """
 Usage: bear-code [options] [prompt]
 
 Options:
@@ -356,7 +431,10 @@ REPL commands:
   /memory             List saved memories
   /skills             List available skills
   /skill-stats        Show skill usage and evolution stats
-  /skill-eval         Evaluate online skill evolution quality
+  /skill-status       Show candidate/champion/active lifecycle state
+  /skill-eval         Paired shadow evaluation: /skill-eval <skill> [version]
+  /skill-promote      Activate a gated champion: /skill-promote <skill> <version> [--force]
+  /skill-rollback     Restore a snapshot: /skill-rollback <skill> [version]
   /extract_now        Extract the current pending online skill window: /extract_now [hint]
   /skill-feedback     Record feedback: /skill-feedback <skill> <rating> [note]
   /skill-evolve       Evolve a skill: /skill-evolve <skill> <durable lesson>
@@ -372,7 +450,17 @@ Examples:
   MODEL=gpt-4o OPENAI_API_KEY=sk-xxx OPENAI_BASE_URL=https://aihubmix.com/v1 mini-claude "hello"
   mini-claude --resume
   mini-claude  # starts interactive REPL
-""")
+"""
+
+
+def main() -> None:
+    """CLI 程序入口：准备运行配置，创建 Agent，并按参数选择一次性执行或交互模式。"""
+    # 解析命令行参数，例如 --plan、--resume、--model，以及可选的一次性 prompt。
+    args = parse_args()
+    _load_env_file()
+
+    if args.help:
+        print(HELP_TEXT)
         sys.exit(0)
 
     # 将命令行布尔开关统一转换成 Agent 内部使用的权限模式。

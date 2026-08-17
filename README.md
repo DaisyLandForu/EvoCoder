@@ -317,10 +317,41 @@ agents/skill_evolution.py
 | `/memory` | 列出长期记忆 |
 | `/skills` | 列出可用 Skills |
 | `/skill-stats` | 查看 Skill 使用和演化统计 |
+| `/skill-status` | 查看 Candidate / Champion / Active 生命周期状态 |
+| `/skill-eval <skill> [version]` | 三组重新生成的成对影子评测 |
+| `/skill-promote <skill> <version> [--force]` | 把通过 Gate 的 Champion 原子激活为 Active |
+| `/skill-rollback <skill> [version]` | 回滚到指定版本或上一个健康版本 |
 | `/extract_now [hint]` | 抽取当前 pending window |
 | `/skill-feedback <skill> <rating> [note]` | 记录 Skill 反馈 |
 | `/skill-evolve <skill> <lesson>` | 手动演化 Skill |
 | `/skill-create <name> \| <description> \| <when-to-use> \| <instructions>` | 手动创建 Skill |
+
+## Skill 演化治理（Candidate → Champion → Active）
+
+用户反馈不再直接改写 Active Skill。在线抽取只产出 Candidate，必须经过影子评测和 Gate 才能成为 Champion，再由显式命令原子激活为 Active。
+
+```text
+.bear/skill-evolution/
+├── candidates/<skill>/<version>/SKILL.md   # 用户反馈的唯一落点
+├── champions/<skill>/SKILL.md              # 通过 Gate 的版本
+├── snapshots/<skill>/<time>-<version>/     # 每次激活前的 Active 快照
+├── evaluations/<skill>/<run_id>.json       # 评测产物（含阈值与配置）
+├── holdout/{shared,<skill>}.jsonl          # 与候选生成无关的独立样本
+└── registry.json                           # 版本、状态、来源与迁移历史
+```
+
+Gate 默认阈值（均可用环境变量覆盖，并写入评测产物）：
+
+| 阈值 | 默认值 | 环境变量 |
+|------|--------|----------|
+| 有效成对样本数 | ≥ 20 | `BEAR_GATE_MIN_PAIRS` |
+| 成对任务收益 | > 0 | `BEAR_GATE_MIN_GAIN` |
+| 负迁移率 NTR | ≤ 5% | `BEAR_GATE_MAX_NTR` |
+| Token 成本增幅 | ≤ 15% | `BEAR_GATE_MAX_COST_GROWTH` |
+| 安全/格式硬失败 | 0 | `BEAR_GATE_ALLOW_HARD_FAILURES` |
+| 必须有 Holdout | 是 | `BEAR_GATE_REQUIRE_HOLDOUT` |
+
+NTR 定义为 `#(Champion 通过而 Candidate 失败) / #(Champion 通过)`。样本不足、缺少 Holdout 或 Judge 与 Generator 同模型时，状态为 `incubating`，不会自动晋升。
 
 ## Skills 是什么
 

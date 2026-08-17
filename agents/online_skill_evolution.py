@@ -140,8 +140,15 @@ async def maintain_online_skill_candidate(
     retrieved_reference: dict[str, Any] | None = None,
     confirm_write: ConfirmWrite | None = None,
     target: str = "project",
+    source_provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    from .skills import create_skill, discover_skills, evolve_skill, retrieve_relevant_skills
+    """Turn an extracted candidate into a *candidate* skill version.
+
+    Nothing here can reach the active skill: `add` and `merge` both land in
+    `.bear/skill-evolution/candidates/`, and only a gated promote activates one.
+    """
+    from .skill_registry import create_candidate, read_active, read_champion
+    from .skills import discover_skills, retrieve_relevant_skills
 
     skills = discover_skills()
     exact_target = _exact_identity_match(candidate, skills)
@@ -201,7 +208,9 @@ async def maintain_online_skill_candidate(
     if action == "discard":
         return {"ok": True, "action": "discard", "skill": "", "decision": decision}
 
-    write_summary = f"online skill evolution: {action} {target_skill or candidate.name}"
+    # The write is confined to the candidate store, but it is still a disk write
+    # under the user's project, so the caller's permission hook still applies.
+    write_summary = f"record skill candidate: {action} {target_skill or candidate.name} (not activated)"
     if confirm_write is not None and not await confirm_write(write_summary):
         return {
             "ok": False,
@@ -211,35 +220,70 @@ async def maintain_online_skill_candidate(
             "decision": decision,
         }
 
+    provenance = {
+        "kind": "user_feedback",
+        "action": action,
+        "reason": str(decision.get("reason") or ""),
+        **(source_provenance or {}),
+    }
+
     if action == "merge":
         target_skill = target_skill or top_reference_name
         if not target_skill:
             return {"ok": False, "action": "merge", "error": "missing target_skill", "decision": decision}
-        result = evolve_skill(
+        base = read_champion(target_skill) or read_active(target_skill) or {}
+        instructions = str(
+            decision.get("merged_instructions")
+            or candidate.instructions
+            or base.get("instructions")
+            or ""
+        )
+        result = create_candidate(
             skill_name=target_skill,
-            lesson=candidate.evidence or candidate.description,
-            rationale=str(decision.get("reason") or "Online maintainer merge"),
-            target="active",
-            instructions=str(decision.get("merged_instructions") or candidate.instructions),
-            description=str(decision.get("merged_description") or ""),
-            when_to_use=str(decision.get("merged_when_to_use") or candidate.when_to_use),
-            tags=candidate.tags,
+            description=str(decision.get("merged_description") or base.get("description") or candidate.description),
+            instructions=instructions,
+            when_to_use=str(
+                decision.get("merged_when_to_use") or candidate.when_to_use or base.get("when_to_use") or ""
+            ),
+            tags=candidate.tags or list(base.get("tags") or []),
+            source_provenance=provenance,
+            actor="online",
+            origin="merge",
         )
         return {"action": "merge", "candidate": asdict(candidate), "decision": decision, **result}
 
-    result = create_skill(
-        name=candidate.name,
+    result = create_candidate(
+        skill_name=candidate.name,
         description=candidate.description,
         instructions=candidate.instructions,
         when_to_use=candidate.when_to_use,
-        target=target,
-        context="inline",
-        user_invocable=False,
-        evidence=candidate.evidence,
-        actor="online",
         tags=candidate.tags,
+        source_provenance=provenance,
+        actor="online",
+        origin="add",
     )
     return {"action": "add", "candidate": asdict(candidate), "decision": decision, **result}
+
+
+def _source_provenance(messages: list[dict[str, Any]], *, hint: str = "") -> dict[str, Any]:
+    """Record which samples produced a candidate so they can be barred from holdout."""
+    from .skill_shadow_eval import sample_id_for
+
+    sample_ids: list[str] = []
+    for item in list(messages or []):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("role") or "") != "user":
+            continue
+        content = str(item.get("content") or "").strip()
+        if content:
+            sample_ids.append(sample_id_for(content))
+    return {
+        "kind": "user_feedback",
+        "sample_ids": sample_ids,
+        "sample_count": len(sample_ids),
+        "hint": str(hint or "")[:200],
+    }
 
 
 async def online_ingest(
@@ -288,6 +332,7 @@ async def online_ingest(
             retrieved_reference=retrieved_reference,
             confirm_write=confirm_write,
             target=target,
+            source_provenance=_source_provenance(messages, hint=hint),
         )
     except Exception as exc:
         result = {"ok": False, "action": "failed", "skill": candidate.name, "error": str(exc)}
