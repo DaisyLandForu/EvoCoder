@@ -15,6 +15,7 @@ Bear Agent 是一个基于 Python 实现的 **自进化 Harness Agent**。它不
 - **MCP 外部工具扩展**：自研 stdio JSON-RPC MCP Client，把外部 MCP Server 工具包装为 `mcp__server__tool`。
 - **子 Agent**：支持 `explore`、`plan`、`general` 以及自定义子 Agent，用隔离上下文完成探索、规划或局部任务。
 - **会话恢复和上下文压缩**：自动保存 session，支持 `--resume`、`/compact`，并对大工具结果做截断或持久化。
+- **事件级 Trace 与可复现评测**：每次运行写入 JSONL 轨迹；`benchmarks/` 用冻结配置重跑小规模软件工程任务，CI 不依赖真实 API Key。
 
 ## 项目架构
 
@@ -49,10 +50,16 @@ BearAgent/
 │   ├── online_skill_evolution.py  # 在线 Skill 抽取和 add/merge/discard 决策
 │   ├── skill_evolution.py         # Skill 落盘、版本快照、审计统计
 │   ├── memory.py                  # 长期记忆系统
+│   ├── skill_registry.py          # Skill 六态、Candidate 隔离、Promote/Rollback
+│   ├── skill_shadow_eval.py       # 三臂成对 Shadow 评测
+│   ├── skill_gate.py              # NTR / 收益 / 成本 Gate
+│   ├── trace.py                   # 事件级 JSONL Trace
 │   ├── mcp_client.py              # MCP stdio JSON-RPC 客户端
 │   ├── subagent.py                # 子 Agent 配置
 │   ├── session.py                 # 会话保存与恢复
 │   └── ui.py                      # 终端 UI 输出
+├── benchmarks/                    # 可复现评测：configs / tasks / runner / manifests
+├── .github/workflows/ci.yml       # ruff check + pytest -q
 ├── .bear/
 │   ├── skills/                    # 项目级 Skills
 │   └── skill-evolution/           # Skills 自进化审计产物
@@ -153,6 +160,24 @@ REPL 中也可以输入：
 ```bash
 python3 -m agents.main --resume
 ```
+
+## 轨迹与可复现评测
+
+开启 Trace：
+
+```bash
+python3 -m agents.main --trace "fix the failing test"
+```
+
+默认写入 `.bear/traces/<run_id>.jsonl`。事件包含 `run_id`、`session_id`、`step_id`、`parent_step_id`，覆盖模型请求、策略决定、工具、Memory、Skill 候选/评测和子 Agent。Prompt 默认只记 hash，不写 API Key。
+
+可复现评测（脚本化模型，不需要真实 Key）：
+
+```bash
+python -m benchmarks.runner
+```
+
+产物在 `runs/<run_id>/`，含冻结配置、每题结果、轨迹和 summary。当前仓库可复现的指标只来自这套 runner。wiki 中历史 GAIA / HLE 分数没有对应 runner 与 Trace，标为未验证，不能当作本仓库当前结果。
 
 ## 如何让项目自动沉淀并进化 Skills
 

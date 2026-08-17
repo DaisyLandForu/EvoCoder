@@ -1,0 +1,15 @@
+{
+  "dataset_version": "software-engineering-mini-v1",
+  "model": "scripted-openai",
+  "provider": "openai",
+  "temperature": 0.0,
+  "seed": 7,
+  "max_cost_usd": 1.0,
+  "max_turns": 8,
+  "timeout_s": 30,
+  "tool_timeout_s": 10,
+  "tools": ["read_file", "write_file", "edit_file", "list_files"],
+  "skill_version": null,
+  "memory_enabled": false,
+  "folding_enabled": true
+}

@@ -102,6 +102,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", action="store_true", help="Resume last session")
     parser.add_argument("--max-cost", type=float, default=None, help="Max USD spend")
     parser.add_argument("--max-turns", type=int, default=None, help="Max agentic turns")
+    parser.add_argument("--trace", action="store_true", help="Write event-level JSONL traces")
+    parser.add_argument("--trace-dir", default=None, help="Trace file or directory")
     parser.add_argument("--help", "-h", action="store_true", help="Show help")
     return parser.parse_args()
 
@@ -421,6 +423,8 @@ Options:
   --resume            Resume the last session
   --max-cost USD      Stop when estimated cost exceeds this amount
   --max-turns N       Stop after N agentic turns
+  --trace             Write event-level JSONL traces for this run
+  --trace-dir PATH    Trace file or directory (default: .bear/traces)
   --help, -h          Show this help
 
 REPL commands:
@@ -446,6 +450,7 @@ Examples:
   mini-claude --yolo "run all tests and fix failures"
   mini-claude --plan "how would you refactor this?"
   mini-claude --max-cost 0.50 --max-turns 20 "implement feature X"
+  mini-claude --trace "fix the failing test"
   MODEL=deepseek-chat APIKEY=sk-xxx API=https://api.deepseek.com/anthropic mini-claude "hello"
   MODEL=gpt-4o OPENAI_API_KEY=sk-xxx OPENAI_BASE_URL=https://aihubmix.com/v1 mini-claude "hello"
   mini-claude --resume
@@ -489,6 +494,9 @@ def main() -> None:
         max_cost_usd=args.max_cost,
         max_turns=args.max_turns,
         thinking=args.thinking,
+        trace_enabled=bool(args.trace or os.environ.get("BEAR_TRACE")),
+        trace_path=args.trace_dir or os.environ.get("BEAR_TRACE_DIR"),
+        trace_include_bodies=bool(os.environ.get("BEAR_TRACE_BODIES")),
     )
     agent = Agent(
         config=runtime_config,

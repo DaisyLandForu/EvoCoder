@@ -1,0 +1,4 @@
+{"task_id": "se-write-hello", "prompt": "Create hello.py that prints Hello", "success_check": {"type": "file_contains", "path": "hello.py", "text": "Hello"}}
+{"task_id": "se-edit-app", "prompt": "Change src/app.py so it prints ready", "success_check": {"type": "file_contains", "path": "src/app.py", "text": "ready"}}
+{"task_id": "se-read-app", "prompt": "What does src/app.py print?", "success_check": {"type": "output_contains", "text": "ok"}}
+{"task_id": "se-wrong-output", "prompt": "Create hello.py that prints Hello", "success_check": {"type": "file_contains", "path": "hello.py", "text": "Hello"}}

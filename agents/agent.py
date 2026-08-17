@@ -20,6 +20,14 @@ from agents.plan_mode import PlanModeController, PlanPhase
 from agents.policy import CONCURRENCY_SAFE_TOOLS as POLICY_SAFE_TOOLS, PolicyDecision, PolicyEngine
 from agents.prompt import build_system_prompt
 from agents.runtime_config import RuntimeConfig
+from agents.trace import (
+    TraceRecorder,
+    emit_trace,
+    estimate_cost_usd,
+    hash_prompt,
+    parse_model_usage,
+    resolve_trace_path,
+)
 from agents.session_memory import (
     FOLD_SESSION_MEMORY_SYSTEM,
     build_anthropic_transcript,
@@ -243,6 +251,9 @@ class Agent:
         self._tool_error_streak: int = 0
         self._same_tool_repeat_count: int = 0
         self._last_tool_name: str = ""
+        self._tracer: TraceRecorder | None = None
+        self._run_id: str | None = None
+        self._run_step_id: str | None = None
 
         #构建系统提示词
         self._base_system_prompt = custom_system_prompt or build_system_prompt()
@@ -271,6 +282,89 @@ class Agent:
             self._openai_client = None
 
         self._refresh_runtime_system_prompt()
+        self._attach_tracer(parent_agent)
+
+    def _attach_tracer(self, parent_agent: Agent | None) -> None:
+        if parent_agent is not None and parent_agent._tracer is not None:
+            self._tracer = parent_agent._tracer
+            self._run_id = parent_agent._run_id
+            return
+        if not self.config.trace_enabled:
+            return
+        from agents.trace import new_run_id
+
+        self._run_id = new_run_id()
+        path = resolve_trace_path(self.config.trace_path, self._run_id, workspace=self.config.workspace)
+        self._tracer = TraceRecorder(
+            run_id=self._run_id,
+            session_id=self.session_id,
+            path=path,
+            model=self.model,
+            provider=self.config.provider,
+            include_bodies=bool(self.config.trace_include_bodies),
+        )
+
+    def _emit_trace(self, event_type: str, **fields: Any) -> str | None:
+        tracer = self._tracer
+        if tracer is None:
+            return emit_trace(event_type, **fields)
+        skill_ref = self._last_retrieved_skill_reference or {}
+        fields.setdefault("skill_name", skill_ref.get("name"))
+        fields.setdefault("skill_version", skill_ref.get("version"))
+        if self._run_step_id and "parent_step_id" not in fields:
+            fields["parent_step_id"] = self._run_step_id
+        return tracer.emit(event_type, **fields)
+
+    def _apply_model_usage(self, usage: Any, *, parent_step_id: str | None, latency_ms: float, prompt_hash: str) -> None:
+        input_tokens, output_tokens, known = parse_model_usage(usage)
+        self._record_usage(input_tokens, output_tokens, known=known)
+        if known and input_tokens is not None:
+            self.last_input_token_count = input_tokens
+        rates = self._budget if self._budget is not None else None
+        cost = estimate_cost_usd(
+            input_tokens,
+            output_tokens,
+            input_usd_per_mtok=getattr(rates, "input_usd_per_mtok", 3.0),
+            output_usd_per_mtok=getattr(rates, "output_usd_per_mtok", 15.0),
+        )
+        self._emit_trace(
+            "model_response",
+            parent_step_id=parent_step_id,
+            prompt_hash=prompt_hash,
+            latency_ms=round(latency_ms, 3),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            estimated_cost=cost,
+            error_type=None if known else "unknown_usage",
+            usage_status="ok" if known else "unknown",
+        )
+
+    async def _trace_side_query_call(self, do, *, system: str, user_message: str):
+        started = time.monotonic()
+        prompt_hash = hash_prompt({"system": system, "user": user_message})
+        req = self._emit_trace("model_request", prompt_hash=prompt_hash, call_kind="side_query")
+        try:
+            resp = await self._call_model_with_timeout(do)
+        except Exception as exc:
+            self._emit_trace(
+                "model_response",
+                parent_step_id=req,
+                prompt_hash=prompt_hash,
+                error_type=type(exc).__name__,
+                call_kind="side_query",
+                latency_ms=round((time.monotonic() - started) * 1000, 3),
+            )
+            raise
+        usage = getattr(resp, "usage", None)
+        if usage is None and isinstance(resp, dict):
+            usage = resp.get("usage")
+        self._apply_model_usage(
+            usage,
+            parent_step_id=req,
+            latency_ms=(time.monotonic() - started) * 1000,
+            prompt_hash=prompt_hash,
+        )
+        return resp
 
     #判断返回模型的思考模式
     def _resolve_thinking_mode(self) -> str:
@@ -339,7 +433,7 @@ class Agent:
                         messages=[{"role": "user", "content": user_message}],
                     )
 
-                resp = await self._call_model_with_timeout(_call)
+                resp = await self._trace_side_query_call(_call, system=system, user_message=user_message)
                 text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
                 if not text.strip():
                     block_types = [str(getattr(b, "type", "")) for b in getattr(resp, "content", [])]
@@ -365,7 +459,7 @@ class Agent:
                         ],
                     )
 
-                resp = await self._call_model_with_timeout(_call)
+                resp = await self._trace_side_query_call(_call, system=system, user_message=user_message)
                 if not resp.choices:
                     logging.warning("side_query returned no OpenAI-compatible choices: model=%s", model)
                     return ""
@@ -437,6 +531,10 @@ class Agent:
     #主入口
 
     async def  chat(self, user_message:str)->None:
+        started = time.monotonic()
+        tracer_token = None
+        parent_token = None
+        error_type = None
         #懒加载MCP服务在第一次chat的时候
         if not self._mcp_initialized and not self.is_sub_agent:
             self._mcp_initialized = True
@@ -458,6 +556,24 @@ class Agent:
                 original_user_message
             )
 
+        owns_run = self._tracer is not None and self._parent_agent is None
+        if owns_run:
+            prompt_hash = hash_prompt(original_user_message)
+            self._run_step_id = self._emit_trace(
+                "run_start",
+                parent_step_id=None,
+                prompt_hash=prompt_hash,
+            )
+            tracer_token, parent_token = self._tracer.bind(self._run_step_id)
+            if self._last_retrieved_skill_reference:
+                hits = self._last_retrieved_skill_hits or [self._last_retrieved_skill_reference]
+                for hit in hits:
+                    self._emit_trace(
+                        "skill_retrieved",
+                        skill_name=hit.get("name"),
+                        skill_version=hit.get("version"),
+                    )
+
         self._aborted = False
         self._turn_output_buffer = []
         coro = self._chat_openai(user_message) if self.use_openai else self._chat_anthropic(user_message)
@@ -466,9 +582,27 @@ class Agent:
             await self._current_task
         except asyncio.CancelledError:
             self._aborted = True
-
+            error_type = "CancelledError"
+        except Exception as exc:
+            error_type = type(exc).__name__
+            self._emit_trace("run_error", error_type=error_type)
+            raise
         finally:
             self._current_task = None
+            if self._tracer is not None and self._parent_agent is None:
+                budget = self._budget.snapshot() if self._budget is not None else {}
+                self._emit_trace(
+                    "run_finished",
+                    parent_step_id=self._run_step_id,
+                    latency_ms=round((time.monotonic() - started) * 1000, 3),
+                    input_tokens=self.total_input_tokens,
+                    output_tokens=self.total_output_tokens,
+                    estimated_cost=budget.get("estimated_cost_usd"),
+                    exit_code=1 if (self._aborted or error_type) else 0,
+                    error_type=error_type,
+                    usage_status=budget.get("usage_status"),
+                )
+                TraceRecorder.unbind(tracer_token, parent_token)
         assistant_text = "".join(self._turn_output_buffer or []).strip()
         self._turn_output_buffer = None
         if not self.is_sub_agent and not self._aborted:
@@ -794,13 +928,16 @@ class Agent:
             return {"exceeded": True, "reason": f"Turn limit reached ({self.current_turns} >= {self.max_turns})"}
         return {"exceeded": False}
 
-    def _record_usage(self, input_tokens: int, output_tokens: int) -> None:
-        self.total_input_tokens += input_tokens
-        self.total_output_tokens += output_tokens
+    def _record_usage(self, input_tokens: int | None, output_tokens: int | None, *, known: bool = True) -> None:
         if self._budget is not None:
-            # Keep shared counters authoritative for parent/child accounting.
-            self._budget.input_tokens = self.total_input_tokens
-            self._budget.output_tokens = self.total_output_tokens
+            self._budget.add_usage(input_tokens, output_tokens, known=known)
+            self.total_input_tokens = self._budget.input_tokens
+            self.total_output_tokens = self._budget.output_tokens
+            return
+        if not known or input_tokens is None or output_tokens is None:
+            return
+        self.total_input_tokens += int(input_tokens)
+        self.total_output_tokens += int(output_tokens)
 
     #压缩会话
     async def compact(self)->None:
@@ -977,6 +1114,11 @@ class Agent:
             save_folded_session_memory(self.session_id, _sanitize_for_utf8(record), workspace=self.config.workspace)
         except Exception:
             pass
+        self._emit_trace(
+            "context_compacted",
+            artifact_path=str(self.config.workspace / ".bear" / "sessions"),
+            error_type=None,
+        )
 
     #多层级压缩流水线
     def _run_compression_pipeline(self)->None:
@@ -1207,6 +1349,11 @@ class Agent:
                 else [t for t in self.tools if t["name"] != "agent"]
             )
             print_sub_agent_start("skill-fork", inp.get("skill_name", ""))
+            fork_step = self._emit_trace(
+                "subagent_started",
+                tool_name="skill",
+                skill_name=str(inp.get("skill_name") or ""),
+            )
             child_config, child_policy = self._child_runtime(agent_type="general", readonly=self.permission_mode == "plan")
             sub_agent = Agent(
                 config=child_config,
@@ -1220,9 +1367,24 @@ class Agent:
                 sub_result = await sub_agent.run_once(inp.get("args") or "Execute this skill task.")
                 self._absorb_child_usage()
                 print_sub_agent_end("skill-fork", inp.get("skill_name", ""))
+                self._emit_trace(
+                    "subagent_finished",
+                    parent_step_id=fork_step,
+                    tool_name="skill",
+                    skill_name=str(inp.get("skill_name") or ""),
+                    exit_code=0,
+                )
                 return sub_result["text"] or "(Skill produced no output)"
             except Exception as e:
                 print_sub_agent_end("skill-fork", inp.get("skill_name", ""))
+                self._emit_trace(
+                    "subagent_finished",
+                    parent_step_id=fork_step,
+                    tool_name="skill",
+                    skill_name=str(inp.get("skill_name") or ""),
+                    exit_code=1,
+                    error_type=type(e).__name__,
+                )
                 return f"Skill fork error: {e}"
 
         return f'[Skill "{inp.get("skill_name", "")}" activated]\n\n{result["prompt"]}'
@@ -1304,6 +1466,12 @@ class Agent:
         description = inp.get("description", "sub-agent task")
         prompt = inp.get("prompt", "")
         print_sub_agent_start(agent_type, description)
+        started = time.monotonic()
+        step = self._emit_trace(
+            "subagent_started",
+            tool_name="agent",
+            skill_name=str(agent_type),
+        )
 
         config = get_sub_agent_config(agent_type)
         child_config, child_policy = self._child_runtime(agent_type=str(agent_type))
@@ -1319,18 +1487,62 @@ class Agent:
             result = await sub_agent.run_once(prompt)
             self._absorb_child_usage()
             print_sub_agent_end(agent_type, description)
+            self._emit_trace(
+                "subagent_finished",
+                parent_step_id=step,
+                tool_name="agent",
+                skill_name=str(agent_type),
+                latency_ms=round((time.monotonic() - started) * 1000, 3),
+                input_tokens=result.get("tokens", {}).get("input"),
+                output_tokens=result.get("tokens", {}).get("output"),
+                exit_code=0,
+            )
             return result["text"] or "(Sub-agent produced no output)"
         except Exception as e:
             print_sub_agent_end(agent_type, description)
+            self._emit_trace(
+                "subagent_finished",
+                parent_step_id=step,
+                tool_name="agent",
+                skill_name=str(agent_type),
+                latency_ms=round((time.monotonic() - started) * 1000, 3),
+                exit_code=1,
+                error_type=type(e).__name__,
+            )
             return f"Sub-agent error: {e}"
 
     async def _authorize_scheduled_call(self, call: NormalizedToolCall) -> PolicyDecision:
-        return self._policy.authorize(call.name, call.arguments)
+        started = time.monotonic()
+        decision = self._policy.authorize(call.name, call.arguments)
+        self._emit_trace(
+            "policy_decision",
+            tool_call_id=call.tool_call_id,
+            tool_name=call.name,
+            permission_decision=decision.action,
+            latency_ms=round((time.monotonic() - started) * 1000, 3),
+            error_type=None if decision.allowed else decision.reason,
+        )
+        return decision
 
     async def _execute_scheduled_call(self, call: NormalizedToolCall) -> ScheduledToolResult:
+        started = time.monotonic()
+        start_step = self._emit_trace(
+            "tool_started",
+            tool_call_id=call.tool_call_id,
+            tool_name=call.name,
+        )
         try:
             raw = await self._execute_tool_call(call.name, call.arguments)
         except Exception as exc:
+            self._emit_trace(
+                "tool_finished",
+                parent_step_id=start_step,
+                tool_call_id=call.tool_call_id,
+                tool_name=call.name,
+                latency_ms=round((time.monotonic() - started) * 1000, 3),
+                exit_code=1,
+                error_type=type(exc).__name__,
+            )
             return ScheduledToolResult(
                 tool_call_id=call.tool_call_id,
                 name=call.name,
@@ -1346,6 +1558,19 @@ class Agent:
         self._record_tool_outcome(call.name, not failed)
         status = "failure" if failed else "success"
         error_type = "context_cleared" if self._context_cleared else ("tool_failure" if failed else None)
+        artifact = None
+        if persisted != raw:
+            artifact = persisted
+        self._emit_trace(
+            "tool_finished",
+            parent_step_id=start_step,
+            tool_call_id=call.tool_call_id,
+            tool_name=call.name,
+            latency_ms=round((time.monotonic() - started) * 1000, 3),
+            exit_code=1 if failed else 0,
+            error_type=error_type,
+            artifact_path=artifact if isinstance(artifact, str) and artifact.startswith("/") else None,
+        )
         return ScheduledToolResult(
             tool_call_id=call.tool_call_id,
             name=call.name,
@@ -1359,6 +1584,11 @@ class Agent:
         self._scheduler.reset_round()
         for call in calls:
             print_tool_call(call.name, call.arguments)
+            self._emit_trace(
+                "tool_requested",
+                tool_call_id=call.tool_call_id,
+                tool_name=call.name,
+            )
         return await self._scheduler.run_round(
             calls,
             authorize=self._authorize_scheduled_call,
@@ -1444,6 +1674,7 @@ class Agent:
                             # 记录本 session 已经注入过的 memory，后续检索时可避免重复 surfaced。
                             self._already_surfaced_memories.add(m.path)
                             self._session_memory_bytes += m.size
+                        self._emit_trace("memory_retrieved", artifact_path=str(len(memories)))
                 except:
                     # memory 注入失败不应该中断主对话流程。
                     pass
@@ -1451,13 +1682,30 @@ class Agent:
             if not self.is_sub_agent:
                 start_spinner()
 
-            response = await self._call_anthropic_stream()
+            prompt_hash = hash_prompt(self._anthropic_messages)
+            request_step = self._emit_trace("model_request", prompt_hash=prompt_hash, provider="anthropic")
+            model_started = time.monotonic()
+            try:
+                response = await self._call_anthropic_stream()
+            except Exception as exc:
+                self._emit_trace(
+                    "model_response",
+                    parent_step_id=request_step,
+                    prompt_hash=prompt_hash,
+                    error_type=type(exc).__name__,
+                    latency_ms=round((time.monotonic() - model_started) * 1000, 3),
+                )
+                raise
             if not self.is_sub_agent:
                 stop_spinner()
 
             self.last_api_call_time = time.time()
-            self._record_usage(response.usage.input_tokens, response.usage.output_tokens)
-            self.last_input_token_count = response.usage.input_tokens
+            self._apply_model_usage(
+                getattr(response, "usage", None),
+                parent_step_id=request_step,
+                latency_ms=(time.monotonic() - model_started) * 1000,
+                prompt_hash=prompt_hash,
+            )
 
             tool_uses = [b for b in response.content if b.type == "tool_use"]
             self._anthropic_messages.append({
@@ -1638,22 +1886,38 @@ class Agent:
                         for m in memories:
                             self._already_surfaced_memories.add(m.path)
                             self._session_memory_bytes += len(m.content.encode())
+                        self._emit_trace("memory_retrieved", artifact_path=str(len(memories)))
                 except Exception:
                     pass
 
             if not self.is_sub_agent:
                 start_spinner()
 
-            response = await self._call_openai_stream()
+            prompt_hash = hash_prompt(self._openai_messages)
+            request_step = self._emit_trace("model_request", prompt_hash=prompt_hash, provider="openai")
+            model_started = time.monotonic()
+            try:
+                response = await self._call_openai_stream()
+            except Exception as exc:
+                self._emit_trace(
+                    "model_response",
+                    parent_step_id=request_step,
+                    prompt_hash=prompt_hash,
+                    error_type=type(exc).__name__,
+                    latency_ms=round((time.monotonic() - model_started) * 1000, 3),
+                )
+                raise
 
             if not self.is_sub_agent:
                 stop_spinner()
 
             self.last_api_call_time = time.time()
-
-            if response.get("usage"):
-                self._record_usage(response["usage"]["prompt_tokens"], response["usage"]["completion_tokens"])
-                self.last_input_token_count = response["usage"]["prompt_tokens"]
+            self._apply_model_usage(
+                response.get("usage") if isinstance(response, dict) else None,
+                parent_step_id=request_step,
+                latency_ms=(time.monotonic() - model_started) * 1000,
+                prompt_hash=prompt_hash,
+            )
 
             choice = response.get("choices", [{}])[0] if response.get("choices") else {}
             message = choice.get("message", {})
@@ -1756,7 +2020,7 @@ class Agent:
                     },
                     "finish_reason": finish_reason or "stop",
                 }],
-                "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0},
+                "usage": usage,
             }
 
         return await _with_retry(lambda: self._call_model_with_timeout(_do))

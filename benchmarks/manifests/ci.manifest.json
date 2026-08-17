@@ -1,0 +1,7 @@
+{
+  "dataset_version": "software-engineering-mini-v1",
+  "description": "Tiny software-engineering tasks for CI. Failures are kept; no live API.",
+  "task_file": "benchmarks/tasks/software_engineering_mini.jsonl",
+  "task_ids": ["se-write-hello", "se-edit-app", "se-read-app", "se-wrong-output"],
+  "notes": "se-wrong-output is an intentional miss so failed samples stay in the result set."
+}

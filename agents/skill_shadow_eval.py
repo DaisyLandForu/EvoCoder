@@ -572,6 +572,18 @@ async def run_paired_evaluation(
         )
 
     artifact["ok"] = True
+    try:
+        from .trace import emit_trace
+
+        emit_trace(
+            "skill_evaluated",
+            skill_name=skill_name,
+            skill_version=version,
+            artifact_path=str(artifact.get("artifact_path") or ""),
+            error_type=None if artifact.get("ok") else "evaluation_failed",
+        )
+    except Exception:
+        pass
     return artifact
 
 

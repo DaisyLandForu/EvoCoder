@@ -44,10 +44,21 @@ class BudgetTracker:
     current_turns: int = 0
     input_usd_per_mtok: float = 3.0
     output_usd_per_mtok: float = 15.0
+    unknown_usage_count: int = 0
 
-    def add_usage(self, input_tokens: int, output_tokens: int) -> None:
-        self.input_tokens += max(0, int(input_tokens or 0))
-        self.output_tokens += max(0, int(output_tokens or 0))
+    def add_usage(
+        self,
+        input_tokens: int | None,
+        output_tokens: int | None,
+        *,
+        known: bool = True,
+    ) -> None:
+        """Add known usage. Missing provider usage is marked unknown and never stored as 0."""
+        if not known or input_tokens is None or output_tokens is None:
+            self.unknown_usage_count += 1
+            return
+        self.input_tokens += max(0, int(input_tokens))
+        self.output_tokens += max(0, int(output_tokens))
 
     def add_turn(self) -> None:
         self.current_turns += 1
@@ -56,6 +67,19 @@ class BudgetTracker:
         return (self.input_tokens / 1_000_000) * self.input_usd_per_mtok + (
             self.output_tokens / 1_000_000
         ) * self.output_usd_per_mtok
+
+    def usage_status(self) -> str:
+        return "unknown" if self.unknown_usage_count else "complete"
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "estimated_cost_usd": self.cost_usd(),
+            "unknown_usage_count": self.unknown_usage_count,
+            "usage_status": self.usage_status(),
+            "current_turns": self.current_turns,
+        }
 
     def exceeded(self) -> dict[str, Any]:
         if self.max_cost_usd is not None and self.cost_usd() >= self.max_cost_usd:
@@ -97,13 +121,19 @@ class RuntimeConfig:
     tool_timeout_s: float = 30.0
     max_cost_usd: float | None = None
     max_turns: int | None = None
+    temperature: float | None = None
+    seed: int | None = None
     trace_enabled: bool = False
+    trace_path: Path | None = None
+    trace_include_bodies: bool = False
     mcp_trusted: bool = False
     thinking: bool = False
     budget: BudgetTracker | None = None
 
     def __post_init__(self) -> None:
         self.workspace = normalize_workspace(self.workspace)
+        if self.trace_path is not None:
+            self.trace_path = Path(self.trace_path).expanduser()
         if self.budget is None:
             self.budget = BudgetTracker(
                 max_cost_usd=self.max_cost_usd,

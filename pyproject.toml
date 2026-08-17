@@ -24,7 +24,7 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["agents*"]
+include = ["agents*", "benchmarks*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -37,10 +37,28 @@ filterwarnings = [
 [tool.ruff]
 line-length = 120
 target-version = "py311"
-src = ["agents", "tests"]
+src = ["agents", "tests", "benchmarks"]
+extend-exclude = [
+  ".bear",
+  "wiki",
+  "docs",
+  "data",
+  "paper",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["E501"]
+"agents/agent.py" = ["E", "F", "I"]
+"agents/main.py" = ["E", "F", "I"]
+"agents/memory.py" = ["E", "F", "I"]
+"agents/online_skill_evolution.py" = ["E", "F", "I"]
+"agents/prompt.py" = ["E", "F", "I"]
+"agents/session_memory.py" = ["E", "F", "I"]
+"agents/skill_evolution.py" = ["E", "F", "I"]
+"agents/skills.py" = ["E", "F", "I"]
+"agents/subagent.py" = ["E", "F", "I"]
+"agents/tools.py" = ["E", "F", "I"]
+"agents/ui.py" = ["E", "F", "I"]

@@ -346,6 +346,14 @@ async def online_ingest(
         decision=result.get("decision") if isinstance(result.get("decision"), dict) else None,
         error="" if result.get("ok") else str(result.get("error") or ""),
     )
+    if result.get("ok") and str(result.get("action") or "") in {"add", "merge"}:
+        from .trace import emit_trace
+
+        emit_trace(
+            "skill_candidate_created",
+            skill_name=str(result.get("skill") or candidate.name),
+            skill_version=str(result.get("version") or ""),
+        )
     return result
 
 
