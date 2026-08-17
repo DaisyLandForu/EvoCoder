@@ -25,6 +25,7 @@ from agents.trace import (
     emit_trace,
     estimate_cost_usd,
     hash_prompt,
+    new_run_id,
     parse_model_usage,
     resolve_trace_path,
 )
@@ -180,6 +181,7 @@ class Agent:
         self.use_openai = config.use_openai
         self.is_sub_agent = is_sub_agent
         self.tools = custom_tools or tool_definitions
+        self._apply_allowed_tools()
         self.max_cost_usd = config.max_cost_usd
         self.max_turns = config.max_turns
         self.confirm_fn = confirm_fn
@@ -284,15 +286,27 @@ class Agent:
         self._refresh_runtime_system_prompt()
         self._attach_tracer(parent_agent)
 
+    def _apply_allowed_tools(self) -> None:
+        allowed = self.config.allowed_tools
+        if allowed is None:
+            return
+        allow = set(allowed)
+        self.tools = [tool for tool in self.tools if tool.get("name") in allow]
+
+    def _generation_kwargs(self) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {}
+        if self.config.temperature is not None:
+            kwargs["temperature"] = float(self.config.temperature)
+        if self.config.seed is not None and self.use_openai:
+            kwargs["seed"] = int(self.config.seed)
+        return kwargs
+
     def _attach_tracer(self, parent_agent: Agent | None) -> None:
         if parent_agent is not None and parent_agent._tracer is not None:
-            self._tracer = parent_agent._tracer
-            self._run_id = parent_agent._run_id
+            self._bind_child_trace(parent_agent, parent_agent._run_step_id)
             return
-        if not self.config.trace_enabled:
-            return
-        from agents.trace import new_run_id
 
+    def _begin_root_run(self) -> None:
         self._run_id = new_run_id()
         path = resolve_trace_path(self.config.trace_path, self._run_id, workspace=self.config.workspace)
         self._tracer = TraceRecorder(
@@ -303,6 +317,11 @@ class Agent:
             provider=self.config.provider,
             include_bodies=bool(self.config.trace_include_bodies),
         )
+
+    def _bind_child_trace(self, parent_agent: Agent, step_id: str | None) -> None:
+        self._tracer = parent_agent._tracer
+        self._run_id = parent_agent._run_id
+        self._run_step_id = step_id
 
     def _emit_trace(self, event_type: str, **fields: Any) -> str | None:
         tracer = self._tracer
@@ -431,6 +450,7 @@ class Agent:
                     return await client.messages.create(
                         model=model, max_tokens=max(1, int(max_tokens)), system=system,
                         messages=[{"role": "user", "content": user_message}],
+                        **self._generation_kwargs(),
                     )
 
                 resp = await self._trace_side_query_call(_call, system=system, user_message=user_message)
@@ -457,6 +477,7 @@ class Agent:
                             {"role": "system", "content": system},
                             {"role": "user", "content": user_message},
                         ],
+                        **self._generation_kwargs(),
                     )
 
                 resp = await self._trace_side_query_call(_call, system=system, user_message=user_message)
@@ -543,6 +564,7 @@ class Agent:
                 mcp_defs = self._mcp_manager.get_tool_definitions()
                 if mcp_defs:
                     self.tools = self.tools + mcp_defs
+                    self._apply_allowed_tools()
             except Exception as e:
                 print_error(f"MCP init failed: {e}")
 
@@ -556,8 +578,9 @@ class Agent:
                 original_user_message
             )
 
-        owns_run = self._tracer is not None and self._parent_agent is None
+        owns_run = bool(self.config.trace_enabled) and self._parent_agent is None
         if owns_run:
+            self._begin_root_run()
             prompt_hash = hash_prompt(original_user_message)
             self._run_step_id = self._emit_trace(
                 "run_start",
@@ -579,41 +602,50 @@ class Agent:
         coro = self._chat_openai(user_message) if self.use_openai else self._chat_anthropic(user_message)
         self._current_task = asyncio.create_task(coro)
         try:
-            await self._current_task
-        except asyncio.CancelledError:
-            self._aborted = True
-            error_type = "CancelledError"
-        except Exception as exc:
-            error_type = type(exc).__name__
-            self._emit_trace("run_error", error_type=error_type)
-            raise
+            try:
+                await self._current_task
+            except asyncio.CancelledError:
+                self._aborted = True
+                error_type = "CancelledError"
+            except Exception as exc:
+                error_type = type(exc).__name__
+                self._emit_trace("run_error", error_type=error_type)
+                raise
+            finally:
+                self._current_task = None
+            assistant_text = "".join(self._turn_output_buffer or []).strip()
+            self._turn_output_buffer = None
+            if not self.is_sub_agent and not self._aborted:
+                self._schedule_background_skill_task(
+                    self._run_skill_usage_tracking(original_user_message, assistant_text)
+                )
+                if ready_skill_extraction_window:
+                    self._schedule_background_skill_task(
+                        self._run_online_skill_evolution(ready_skill_extraction_window)
+                    )
+                if owns_run:
+                    await self.drain_background_skill_tasks()
+                self._set_pending_skill_extraction_window(
+                    original_user_message=original_user_message,
+                    assistant_text=assistant_text,
+                    retrieved_reference=self._last_retrieved_skill_reference,
+                )
         finally:
-            self._current_task = None
-            if self._tracer is not None and self._parent_agent is None:
+            if owns_run:
                 budget = self._budget.snapshot() if self._budget is not None else {}
+                unknown = budget.get("usage_status") != "complete"
                 self._emit_trace(
                     "run_finished",
                     parent_step_id=self._run_step_id,
                     latency_ms=round((time.monotonic() - started) * 1000, 3),
-                    input_tokens=self.total_input_tokens,
-                    output_tokens=self.total_output_tokens,
+                    input_tokens=None if unknown else budget.get("input_tokens", self.total_input_tokens),
+                    output_tokens=None if unknown else budget.get("output_tokens", self.total_output_tokens),
                     estimated_cost=budget.get("estimated_cost_usd"),
                     exit_code=1 if (self._aborted or error_type) else 0,
                     error_type=error_type,
                     usage_status=budget.get("usage_status"),
                 )
                 TraceRecorder.unbind(tracer_token, parent_token)
-        assistant_text = "".join(self._turn_output_buffer or []).strip()
-        self._turn_output_buffer = None
-        if not self.is_sub_agent and not self._aborted:
-            self._schedule_background_skill_task(self._run_skill_usage_tracking(original_user_message, assistant_text))
-            if ready_skill_extraction_window:
-                self._schedule_background_skill_task(self._run_online_skill_evolution(ready_skill_extraction_window))
-            self._set_pending_skill_extraction_window(
-                original_user_message=original_user_message,
-                assistant_text=assistant_text,
-                retrieved_reference=self._last_retrieved_skill_reference,
-            )
         if not self.is_sub_agent:
             print_divider()
             self._auto_save()
@@ -910,11 +942,15 @@ class Agent:
         total = self._get_current_cost_usd()
         budget_info = f" / ${self.max_cost_usd} budget" if self.max_cost_usd else ""
         turn_info = f" | Turns: {self.current_turns}/{self.max_turns}" if self.max_turns else ""
+        if total is None:
+            cost_text = "unknown (incomplete usage)"
+        else:
+            cost_text = f"${total:.4f}"
         print_info(
-            f"Tokens: {self.total_input_tokens} in / {self.total_output_tokens} out\n  Estimated cost: ${total:.4f}{budget_info}{turn_info}")
+            f"Tokens: {self.total_input_tokens} in / {self.total_output_tokens} out\n  Estimated cost: {cost_text}{budget_info}{turn_info}")
 
     #获取当前的花费，
-    def _get_current_cost_usd(self) -> float:
+    def _get_current_cost_usd(self) -> float | None:
         if self._budget is not None:
             return self._budget.cost_usd()
         return (self.total_input_tokens / 1_000_000) * 3 + (self.total_output_tokens / 1_000_000) * 15
@@ -922,8 +958,9 @@ class Agent:
     def _check_budget(self) -> dict:
         if self._budget is not None:
             return self._budget.exceeded()
-        if self.max_cost_usd is not None and self._get_current_cost_usd() >= self.max_cost_usd:
-            return {"exceeded": True, "reason": f"Cost limit reached (${self._get_current_cost_usd():.4f} >= ${self.max_cost_usd})"}
+        cost = self._get_current_cost_usd()
+        if self.max_cost_usd is not None and cost is not None and cost >= self.max_cost_usd:
+            return {"exceeded": True, "reason": f"Cost limit reached (${cost:.4f} >= ${self.max_cost_usd})"}
         if self.max_turns is not None and self.current_turns >= self.max_turns:
             return {"exceeded": True, "reason": f"Turn limit reached ({self.current_turns} >= {self.max_turns})"}
         return {"exceeded": False}
@@ -1046,6 +1083,8 @@ class Agent:
 
     #自动压缩
     async def _check_and_compact(self)->None:
+        if not self.config.folding_enabled:
+            return
         if self.last_input_token_count > self.effective_window * AUTO_COMPACT_THRESHOLD:
             print_info("Context window filling up, compacting conversation...")
             await self._compact_conversation(trigger="auto")
@@ -1363,6 +1402,7 @@ class Agent:
                 custom_tools=tools,
                 is_sub_agent=True,
             )
+            sub_agent._bind_child_trace(self, fork_step)
             try:
                 sub_result = await sub_agent.run_once(inp.get("args") or "Execute this skill task.")
                 self._absorb_child_usage()
@@ -1483,6 +1523,7 @@ class Agent:
             custom_tools=config["tools"],
             is_sub_agent=True,
         )
+        sub_agent._bind_child_trace(self, step)
         try:
             result = await sub_agent.run_once(prompt)
             self._absorb_child_usage()
@@ -1633,7 +1674,7 @@ class Agent:
         # 异步内存预取：主 agent 才需要查 memory，sub agent 不额外注入记忆。
         # 这里只启动后台任务，不阻塞当前模型调用流程。
         memory_prefetch:MemoryPrefetch | None = None
-        if not self.is_sub_agent:
+        if not self.is_sub_agent and self.config.memory_enabled:
             sq = self._build_side_query()
             if sq:
                 memory_prefetch = start_memory_prefetch(
@@ -1643,6 +1684,10 @@ class Agent:
         while True:
             # 外部请求中止时，结束整个 agent loop。
             if self._aborted:
+                break
+            budget = self._check_budget()
+            if budget["exceeded"]:
+                print_info(f"Budget exceeded: {budget['reason']}")
                 break
 
             # 每轮调用模型前尝试压缩上下文，避免消息历史过长。
@@ -1774,6 +1819,7 @@ class Agent:
                 "system": _safe_utf8_text(self._system_prompt),
                 "tools": _sanitize_for_utf8(get_active_tool_definitions(self.tools)),
                 "messages": _sanitize_for_utf8(self._anthropic_messages),
+                **self._generation_kwargs(),
             }
             #如果开启了思考模式，就给 Anthropic 请求加上 thinking 参数。
             if self._thinking_mode  in ("adaptive", "enabled"):
@@ -1855,7 +1901,7 @@ class Agent:
 
         #预取句柄 MemoryPrefetch
         memory_prefetch: MemoryPrefetch | None = None
-        if not self.is_sub_agent:
+        if not self.is_sub_agent and self.config.memory_enabled:
             sq = self._build_side_query()
             if sq:
                 memory_prefetch = start_memory_prefetch(
@@ -1865,6 +1911,10 @@ class Agent:
 
         while True:
             if self._aborted:
+                break
+            budget = self._check_budget()
+            if budget["exceeded"]:
+                print_info(f"Budget exceeded: {budget['reason']}")
                 break
 
             self._run_compression_pipeline()
@@ -1961,6 +2011,7 @@ class Agent:
                 messages=_sanitize_for_utf8(self._openai_messages),
                 stream=True,
                 stream_options={"include_usage": True},
+                **self._generation_kwargs(),
             )
 
             content = ""

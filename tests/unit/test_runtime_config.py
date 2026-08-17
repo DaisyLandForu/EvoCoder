@@ -2,7 +2,31 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from agents.agent import Agent
 from agents.runtime_config import RuntimeConfig, clamp_permission, workspace_id
+
+
+def test_generation_kwargs_pass_temperature_and_seed(tmp_path: Path) -> None:
+    config = RuntimeConfig(
+        provider="openai",
+        api_key="k",
+        workspace=tmp_path,
+        temperature=0.0,
+        seed=7,
+    )
+    agent = Agent(config=config, is_sub_agent=True)
+    assert agent._generation_kwargs() == {"temperature": 0.0, "seed": 7}
+
+
+def test_allowed_tools_filters_definitions(tmp_path: Path) -> None:
+    config = RuntimeConfig(
+        provider="openai",
+        api_key="k",
+        workspace=tmp_path,
+        allowed_tools=("read_file", "write_file"),
+    )
+    agent = Agent(config=config, is_sub_agent=True)
+    assert {tool["name"] for tool in agent.tools} == {"read_file", "write_file"}
 
 
 def test_child_inherits_openai_base_url(tmp_path: Path) -> None:

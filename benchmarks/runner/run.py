@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import shutil
 import subprocess
@@ -65,6 +66,31 @@ def new_run_id() -> str:
     return f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{uuid.uuid4().hex[:8]}"
 
 
+def tasks_digest(tasks: list[dict[str, Any]]) -> str:
+    payload = [
+        {
+            "task_id": task.get("task_id"),
+            "prompt": task.get("prompt"),
+            "success_check": task.get("success_check"),
+        }
+        for task in tasks
+    ]
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def validate_manifest(manifest: dict[str, Any], tasks: list[dict[str, Any]]) -> str:
+    task_ids = [str(task["task_id"]) for task in tasks]
+    expected_ids = manifest.get("task_ids")
+    if expected_ids is not None and [str(item) for item in expected_ids] != task_ids:
+        raise ValueError(f"manifest task_ids {list(expected_ids)} do not match task file {task_ids}")
+    digest = tasks_digest(tasks)
+    expected_digest = manifest.get("task_digest")
+    if expected_digest and str(expected_digest) != digest:
+        raise ValueError("manifest task_digest does not match task file contents")
+    return digest
+
+
 def check_success(workspace: Path, task: dict[str, Any], output_text: str) -> bool:
     check = task.get("success_check") or {}
     kind = str(check.get("type") or "")
@@ -98,6 +124,7 @@ async def _run_task(task: dict[str, Any], *, run_dir: Path, config: dict[str, An
         shutil.rmtree(task_dir)
     workspace = _prepare_workspace(task_dir, task)
     trace_path = run_dir / "traces" / f"{task_id}.jsonl"
+    tools = config.get("tools")
     runtime = RuntimeConfig(
         provider=str(config.get("provider") or "openai"),
         model=str(config.get("model") or "scripted-openai"),
@@ -113,6 +140,9 @@ async def _run_task(task: dict[str, Any], *, run_dir: Path, config: dict[str, An
         tool_timeout_s=float(config.get("tool_timeout_s") or 10),
         trace_enabled=True,
         trace_path=trace_path,
+        memory_enabled=bool(config.get("memory_enabled", True)),
+        folding_enabled=bool(config.get("folding_enabled", True)),
+        allowed_tools=tuple(str(name) for name in tools) if tools is not None else None,
     )
     agent = Agent(config=runtime, is_sub_agent=True)
     agent._build_side_query = lambda **_kwargs: None  # type: ignore[method-assign]
@@ -226,9 +256,12 @@ async def run_benchmark(
     config = load_json(config_path)
     tasks = load_jsonl(tasks_path)
     manifest = load_json(manifest_path)
+    digest = validate_manifest(manifest, tasks)
     run_id = run_id or new_run_id()
     output_root = Path(output_root or ROOT / "runs")
     run_dir = output_root / run_id
+    if run_dir.exists():
+        shutil.rmtree(run_dir)
     (run_dir / "traces").mkdir(parents=True, exist_ok=True)
     (run_dir / "artifacts").mkdir(parents=True, exist_ok=True)
 
@@ -237,6 +270,7 @@ async def run_benchmark(
         "run_id": run_id,
         "dataset_version": manifest.get("dataset_version") or config.get("dataset_version"),
         "task_ids": [task["task_id"] for task in tasks],
+        "task_digest": digest,
         "git_sha": git_sha(ROOT),
         "config_path": str(config_path),
         "tasks_path": str(tasks_path),

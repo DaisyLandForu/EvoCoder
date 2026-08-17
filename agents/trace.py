@@ -93,6 +93,15 @@ def hash_prompt(value: Any) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def is_secret_key(key: str) -> bool:
+    """Match API key / Authorization names across case and -/_ variants."""
+    text = str(key)
+    if text in REQUIRED_FIELDS:
+        return False
+    normalized = text.lower().replace("-", "_")
+    return bool(_SECRET_KEY_RE.search(normalized))
+
+
 def redact_secrets(value: Any) -> Any:
     if isinstance(value, Mapping):
         out: dict[str, Any] = {}
@@ -100,7 +109,7 @@ def redact_secrets(value: Any) -> Any:
             key_text = str(key)
             if key_text in REQUIRED_FIELDS:
                 out[key_text] = redact_secrets(item) if isinstance(item, (Mapping, list, tuple, str)) else item
-            elif _SECRET_KEY_RE.search(key_text):
+            elif is_secret_key(key_text):
                 out[key_text] = "[REDACTED]"
             else:
                 out[key_text] = redact_secrets(item)
@@ -186,6 +195,7 @@ class TraceRecorder:
         self.provider = provider
         self.include_bodies = include_bodies
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text("", encoding="utf-8")
         self._lock = threading.Lock()
 
     def emit(self, event_type: str, **fields: Any) -> str:
@@ -193,6 +203,8 @@ class TraceRecorder:
             raise ValueError(f"unknown trace event_type: {event_type}")
         step_id = str(fields.pop("step_id", None) or new_step_id())
         parent = fields.pop("parent_step_id", _active_parent_step.get())
+        if event_type == "run_start":
+            parent = None
         event = {name: None for name in REQUIRED_FIELDS}
         event.update(
             {
@@ -272,9 +284,56 @@ def validate_event(event: Mapping[str, Any]) -> list[str]:
     return missing
 
 
-def validate_trace(events: Iterable[Mapping[str, Any]]) -> list[str]:
+def validate_trace_graph(events: Iterable[Mapping[str, Any]]) -> list[str]:
+    """Reject multiple roots, dangling parents, and events after run_finished."""
+    items = list(events)
     errors: list[str] = []
-    for index, event in enumerate(events):
+    by_run: dict[str, list[tuple[int, Mapping[str, Any]]]] = {}
+    for index, event in enumerate(items):
+        run_id = str(event.get("run_id") or "")
+        by_run.setdefault(run_id, []).append((index, event))
+    for run_id, group in by_run.items():
+        starts = [event for _, event in group if event.get("event_type") == "run_start"]
+        finishes = [event for _, event in group if event.get("event_type") == "run_finished"]
+        if len(starts) != 1:
+            errors.append(f"run {run_id}: expected 1 run_start, got {len(starts)}")
+        if len(finishes) != 1:
+            errors.append(f"run {run_id}: expected 1 run_finished, got {len(finishes)}")
+        if group and group[0][1].get("event_type") != "run_start":
+            errors.append(f"run {run_id}: first event is not run_start")
+        if group and group[-1][1].get("event_type") != "run_finished":
+            errors.append(f"run {run_id}: last event is not run_finished")
+        seen_steps: dict[str, Mapping[str, Any]] = {}
+        finished = False
+        for index, event in group:
+            if finished:
+                errors.append(f"event[{index}]: appears after run_finished")
+            step_id = str(event.get("step_id") or "")
+            if not step_id:
+                errors.append(f"event[{index}]: missing step_id")
+            elif step_id in seen_steps:
+                errors.append(f"event[{index}]: duplicate step_id {step_id}")
+            parent = event.get("parent_step_id")
+            event_type = event.get("event_type")
+            if event_type == "run_start":
+                if parent is not None:
+                    errors.append(f"event[{index}]: run_start parent_step_id must be null")
+            elif parent is None:
+                errors.append(f"event[{index}]: missing parent_step_id")
+            elif str(parent) not in seen_steps:
+                errors.append(f"event[{index}]: dangling parent_step_id {parent}")
+            if step_id:
+                seen_steps[step_id] = event
+            if event_type == "run_finished":
+                finished = True
+    return errors
+
+
+def validate_trace(events: Iterable[Mapping[str, Any]]) -> list[str]:
+    items = list(events)
+    errors: list[str] = []
+    for index, event in enumerate(items):
         for problem in validate_event(event):
             errors.append(f"event[{index}]: {problem}")
+    errors.extend(validate_trace_graph(items))
     return errors

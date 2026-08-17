@@ -23,8 +23,9 @@ def test_trace_event_has_required_fields(tmp_path: Path) -> None:
         model="demo",
         provider="openai",
     )
-    recorder.emit("run_start", prompt_hash=hash_prompt("hello"))
-    recorder.emit("model_request", prompt_hash=hash_prompt("hello"), parent_step_id="abc")
+    start = recorder.emit("run_start", prompt_hash=hash_prompt("hello"))
+    recorder.emit("model_request", prompt_hash=hash_prompt("hello"), parent_step_id=start)
+    recorder.emit("run_finished", parent_step_id=start)
     events = read_trace(tmp_path / "run.jsonl")
     assert events
     assert validate_trace(events) == []
@@ -76,6 +77,42 @@ def test_redact_secrets_covers_env_style_keys() -> None:
     assert payload["input_tokens"] == 9
 
 
+def test_redact_secrets_covers_hyphen_headers_and_nested_tool_args() -> None:
+    payload = redact_secrets(
+        {
+            "x-api-key": "plain-credential-123",
+            "X-Api-Key": "plain-credential-456",
+            "proxy-authorization": "Basic abc123",
+            "Proxy-Authorization": "Basic def456",
+            "api-key": "hyphen-key",
+            "tool_arguments": {
+                "headers": {
+                    "x-api-key": "nested-key",
+                    "proxy-authorization": "Basic nested",
+                }
+            },
+        }
+    )
+    assert payload["x-api-key"] == "[REDACTED]"
+    assert payload["X-Api-Key"] == "[REDACTED]"
+    assert payload["proxy-authorization"] == "[REDACTED]"
+    assert payload["Proxy-Authorization"] == "[REDACTED]"
+    assert payload["api-key"] == "[REDACTED]"
+    assert payload["tool_arguments"]["headers"]["x-api-key"] == "[REDACTED]"
+    assert payload["tool_arguments"]["headers"]["proxy-authorization"] == "[REDACTED]"
+
+
+def test_validate_trace_graph_rejects_dangling_parent_and_events_after_finish(tmp_path: Path) -> None:
+    recorder = TraceRecorder(run_id="run-graph", session_id="sess", path=tmp_path / "run.jsonl")
+    start = recorder.emit("run_start", prompt_hash="abc")
+    recorder.emit("model_request", parent_step_id="missing")
+    recorder.emit("run_finished", parent_step_id=start)
+    recorder.emit("model_response", parent_step_id=start)
+    errors = validate_trace(read_trace(tmp_path / "run.jsonl"))
+    assert any("dangling parent_step_id" in item for item in errors)
+    assert any("appears after run_finished" in item for item in errors)
+
+
 def test_missing_usage_is_unknown_not_zero() -> None:
     budget = BudgetTracker()
     budget.add_usage(None, None, known=False)
@@ -83,8 +120,22 @@ def test_missing_usage_is_unknown_not_zero() -> None:
     assert budget.output_tokens == 0
     assert budget.unknown_usage_count == 1
     assert budget.usage_status() == "unknown"
+    assert budget.cost_usd() is None
+    assert budget.snapshot()["estimated_cost_usd"] is None
+    assert budget.snapshot()["estimated_cost_usd"] != 0.0
     assert parse_model_usage(None) == (None, None, False)
     assert parse_model_usage({"prompt_tokens": 4, "completion_tokens": 2}) == (4, 2, True)
+
+
+def test_unknown_usage_with_max_cost_stops_conservatively() -> None:
+    budget = BudgetTracker(max_cost_usd=1.0)
+    budget.add_usage(None, None, known=False)
+    decision = budget.exceeded()
+    assert decision["exceeded"] is True
+    assert "incomplete" in decision["reason"].lower()
+    snapshot = budget.snapshot()
+    assert snapshot["estimated_cost_usd"] is None
+    assert snapshot["usage_status"] == "unknown"
 
 
 def test_known_usage_adds_to_shared_budget() -> None:

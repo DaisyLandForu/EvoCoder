@@ -63,29 +63,47 @@ class BudgetTracker:
     def add_turn(self) -> None:
         self.current_turns += 1
 
-    def cost_usd(self) -> float:
+    def known_cost_usd(self) -> float:
+        """Cost of tokens that were actually reported. Incomplete when usage is unknown."""
         return (self.input_tokens / 1_000_000) * self.input_usd_per_mtok + (
             self.output_tokens / 1_000_000
         ) * self.output_usd_per_mtok
+
+    def cost_usd(self) -> float | None:
+        if self.unknown_usage_count:
+            return None
+        return self.known_cost_usd()
 
     def usage_status(self) -> str:
         return "unknown" if self.unknown_usage_count else "complete"
 
     def snapshot(self) -> dict[str, Any]:
+        cost = self.cost_usd()
         return {
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
-            "estimated_cost_usd": self.cost_usd(),
+            "estimated_cost_usd": cost,
+            "known_cost_usd": self.known_cost_usd(),
             "unknown_usage_count": self.unknown_usage_count,
             "usage_status": self.usage_status(),
             "current_turns": self.current_turns,
         }
 
     def exceeded(self) -> dict[str, Any]:
-        if self.max_cost_usd is not None and self.cost_usd() >= self.max_cost_usd:
+        if self.max_cost_usd is not None and self.unknown_usage_count:
             return {
                 "exceeded": True,
-                "reason": f"Cost limit reached (${self.cost_usd():.4f} >= ${self.max_cost_usd})",
+                "reason": (
+                    "Cost accounting incomplete "
+                    f"({self.unknown_usage_count} unknown usage event(s)); "
+                    "refusing to continue under max_cost"
+                ),
+            }
+        cost = self.cost_usd()
+        if self.max_cost_usd is not None and cost is not None and cost >= self.max_cost_usd:
+            return {
+                "exceeded": True,
+                "reason": f"Cost limit reached (${cost:.4f} >= ${self.max_cost_usd})",
             }
         if self.max_turns is not None and self.current_turns >= self.max_turns:
             return {
@@ -128,6 +146,9 @@ class RuntimeConfig:
     trace_include_bodies: bool = False
     mcp_trusted: bool = False
     thinking: bool = False
+    memory_enabled: bool = True
+    folding_enabled: bool = True
+    allowed_tools: tuple[str, ...] | None = None
     budget: BudgetTracker | None = None
 
     def __post_init__(self) -> None:

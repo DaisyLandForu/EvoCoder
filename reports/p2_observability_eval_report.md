@@ -35,6 +35,11 @@
 - 子 Agent / Skill fork 继承同一 `budget`，父 Run 总成本是全部子调用之和。
 - Provider 没返回 Usage 时：`unknown_usage_count += 1`，token 保持原值，Trace 里 `usage_status=unknown`，`input_tokens`/`output_tokens` 为 `null`。
 - OpenAI 流式组装不再把缺失 Usage 填成 `0`。
+- `cost_usd()` / `snapshot()["estimated_cost_usd"]` 在存在 unknown usage 时为 `null`，绝不回退成 `0.0`。若同时设置了 `max_cost`，按不完整记账保守停止，避免 `--max-cost` 被空 Usage 绕过。
+- 每次根 `chat()` 分配新的 `run_id` 并截断/新建对应 JSONL；子 Agent / Skill fork 的模型事件 `parent_step_id` 指向对应的 `subagent_started`。Skill 后台任务在 `run_finished` 之前 `await drain`。
+- `validate_trace()` 校验唯一根、悬空父节点、以及 `run_finished` 之后是否还有事件。
+- Benchmark 遇到已有 `run_id` 会完整重建目录；`tools` / `memory_enabled` / `folding_enabled` / `temperature` / `seed` 接入 Runtime；manifest 校验 `task_ids` 与 `task_digest`。
+- 脱敏同时覆盖 `x-api-key`、`proxy-authorization` 等 `-` / `_` / 大小写变体，以及嵌套 `tool_arguments`。
 
 ## 5. Benchmark 与产物
 
@@ -68,10 +73,10 @@ runs/<run_id>/
 
 | 测试 | 覆盖 |
 |------|------|
-| `tests/unit/test_trace.py` | schema、hash、脱敏、unknown usage |
-| `tests/integration/test_trace_agent_loop.py` | 模型-工具-策略链路、`parent_step_id`、缺失 Usage |
+| `tests/unit/test_trace.py` | schema、hash、连字符 Header 脱敏、图结构、unknown 成本为 null 且 `max_cost` 保守停 |
+| `tests/integration/test_trace_agent_loop.py` | 模型-工具-策略链路、两次 chat 不同 `run_id`、子 Agent 挂到 `subagent_started`、Candidate 在 `run_finished` 之前、缺失 Usage |
 | `tests/integration/test_side_query_budget.py` | Side Query 计入父预算；父子共享 tracker |
-| `tests/integration/test_benchmark_runner.py` | 冻结产物、每题轨迹、失败样本保留、Skill 版本 |
+| `tests/integration/test_benchmark_runner.py` | 冻结产物、每题轨迹、失败样本保留、Skill 版本、同一 `run_id` 重跑除时间/ID 外一致 |
 
 CI 仍覆盖既有 Fake OpenAI/Anthropic/MCP、Scheduler、Policy、Plan Mode、Session/Memory、Skill Promote/Rollback。
 
@@ -90,3 +95,16 @@ Ruff 对历史 `agents/agent.py` 等文件保持 per-file ignore（P0 已记录�
 | 文档指标映射到产物 | wiki/README 指向 `benchmarks/` 与 `runs/<run_id>/` |
 
 P2 到此结束，未进入后续阶段。
+
+## 9. 审查返工（`2ea0fca` 阻断项）
+
+外部审查对 `2ea0fca` 给出 4 个阻断项后，本提交只修这些项，未进入后续阶段。
+
+| 阻断项 | 修复 |
+|--------|------|
+| 同一 `run_id` 多次 `run_start`；子 Agent 未挂到 `subagent_started`；Candidate 丢在 `run_finished` 之后 | 每次根 `chat()` 新 `run_id`；子 Agent `_run_step_id = subagent_started.step_id`；Skill 任务在 `run_finished` 前 drain；图结构校验 |
+| 相同 `--run-id` 重跑污染 Trace / Skill 版本 / tool steps | 已有目录整棵删除后重建；冻结配置真正传入 Runtime；manifest 校验任务 ID 与内容摘要 |
+| unknown usage 仍以 `0.0` 参与 `max_cost` | 聚合成本为 `null`；设置了 `max_cost` 时按不完整记账停止 |
+| `x-api-key` / `proxy-authorization` 未脱敏 | 键名先 `lower().replace("-", "_")` 再匹配，并覆盖嵌套工具参数 |
+
+复验建议：清理沙箱代理环境变量后跑 `ruff check agents tests benchmarks` 与 `pytest -q`，并确认同一 `--run-id` 连续两次除时间/ID 外结果一致。本轮沙箱结果：`208 passed`，Ruff 全绿。
