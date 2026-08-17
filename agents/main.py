@@ -74,15 +74,22 @@ async def _run_skill_eval(agent, skill_name: str, version: str = "") -> str:
         blinded=True,
     )
     side_query = agent._build_side_query(max_tokens=2400)
-    artifact = await run_paired_evaluation(
-        skill_name=skill_name,
-        candidate_version=version,
-        generate=make_side_query_generator(side_query),
-        judge=side_query,
-        generation_config=generation,
-        judge_config=judge,
-    )
-    return format_evaluation_summary(artifact)
+
+    async def _work() -> str:
+        artifact = await run_paired_evaluation(
+            skill_name=skill_name,
+            candidate_version=version,
+            generate=make_side_query_generator(side_query),
+            judge=side_query,
+            generation_config=generation,
+            judge_config=judge,
+        )
+        return format_evaluation_summary(artifact)
+
+    traced = getattr(agent, "_traced_operation", None)
+    if traced is None:
+        return await _work()
+    return await traced("skill-eval", _work)
 
 
 def parse_args() -> argparse.Namespace:

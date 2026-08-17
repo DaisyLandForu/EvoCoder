@@ -24,6 +24,7 @@ from agents.trace import (
     TraceRecorder,
     emit_trace,
     estimate_cost_usd,
+    get_active_tracer,
     hash_prompt,
     new_run_id,
     parse_model_usage,
@@ -258,6 +259,7 @@ class Agent:
         self._tracer: TraceRecorder | None = None
         self._run_id: str | None = None
         self._run_step_id: str | None = None
+        self._trace_bind_tokens: tuple[Any, Any] | None = None
 
         #构建系统提示词
         self._base_system_prompt = custom_system_prompt or build_system_prompt(
@@ -321,6 +323,85 @@ class Agent:
             provider=self.config.provider,
             include_bodies=bool(self.config.trace_include_bodies),
         )
+
+    def _open_root_run(self, *, prompt_hash: str, tool_name: str | None = None) -> None:
+        self._begin_root_run()
+        self._run_budget_baseline = self._budget.snapshot() if self._budget is not None else None
+        fields: dict[str, Any] = {}
+        if tool_name:
+            fields["tool_name"] = tool_name
+        self._run_step_id = self._emit_trace(
+            "run_start",
+            parent_step_id=None,
+            prompt_hash=prompt_hash,
+            **fields,
+        )
+        if self._tracer is not None:
+            self._trace_bind_tokens = self._tracer.bind(self._run_step_id)
+
+    def _close_root_run(
+        self,
+        *,
+        started: float,
+        error_type: str | None,
+        aborted: bool = False,
+    ) -> None:
+        if self._tracer is None:
+            return
+        session = self._budget.snapshot() if self._budget is not None else {}
+        run_usage = (
+            self._budget.delta_since(self._run_budget_baseline)
+            if self._budget is not None
+            else {}
+        )
+        unknown = run_usage.get("usage_status") != "complete"
+        self._emit_trace(
+            "run_finished",
+            parent_step_id=self._run_step_id,
+            latency_ms=round((time.monotonic() - started) * 1000, 3),
+            input_tokens=None if unknown else run_usage.get("input_tokens"),
+            output_tokens=None if unknown else run_usage.get("output_tokens"),
+            estimated_cost=run_usage.get("estimated_cost_usd"),
+            exit_code=1 if (aborted or error_type) else 0,
+            error_type=error_type,
+            usage_status=run_usage.get("usage_status"),
+            unknown_usage_count=run_usage.get("unknown_usage_count"),
+            session_input_tokens=session.get("input_tokens"),
+            session_output_tokens=session.get("output_tokens"),
+            session_estimated_cost=session.get("estimated_cost_usd"),
+            session_usage_status=session.get("usage_status"),
+        )
+        if self._trace_bind_tokens is not None:
+            TraceRecorder.unbind(*self._trace_bind_tokens)
+        self._trace_bind_tokens = None
+        self._tracer = None
+        self._run_step_id = None
+
+    async def _traced_operation(self, operation: str, work: Callable[[], Awaitable[Any]]) -> Any:
+        """Give REPL commands their own run so they cannot append to a finished chat."""
+        if not self.config.trace_enabled or self._parent_agent is not None:
+            return await work()
+        if get_active_tracer() is not None:
+            return await work()
+        started = time.monotonic()
+        error_type = None
+        self._open_root_run(
+            prompt_hash=hash_prompt({"operation": operation}),
+            tool_name=operation,
+        )
+        try:
+            return await work()
+        except asyncio.CancelledError:
+            error_type = "CancelledError"
+            raise
+        except Exception as exc:
+            error_type = type(exc).__name__
+            self._emit_trace("run_error", error_type=error_type)
+            raise
+        finally:
+            await self._settle_memory_prefetch_tasks()
+            await self.drain_background_skill_tasks()
+            self._close_root_run(started=started, error_type=error_type)
 
     def _bind_child_trace(self, parent_agent: Agent, step_id: str | None) -> None:
         self._tracer = parent_agent._tracer
@@ -570,8 +651,6 @@ class Agent:
 
     async def  chat(self, user_message:str)->None:
         started = time.monotonic()
-        tracer_token = None
-        parent_token = None
         error_type = None
         #懒加载MCP服务在第一次chat的时候
         if not self._mcp_initialized and not self.is_sub_agent:
@@ -597,15 +676,7 @@ class Agent:
 
         owns_run = bool(self.config.trace_enabled) and self._parent_agent is None
         if owns_run:
-            self._begin_root_run()
-            self._run_budget_baseline = self._budget.snapshot() if self._budget is not None else None
-            prompt_hash = hash_prompt(original_user_message)
-            self._run_step_id = self._emit_trace(
-                "run_start",
-                parent_step_id=None,
-                prompt_hash=prompt_hash,
-            )
-            tracer_token, parent_token = self._tracer.bind(self._run_step_id)
+            self._open_root_run(prompt_hash=hash_prompt(original_user_message))
             if self._last_retrieved_skill_reference:
                 hits = self._last_retrieved_skill_hits or [self._last_retrieved_skill_reference]
                 for hit in hits:
@@ -651,30 +722,11 @@ class Agent:
         finally:
             await self._settle_memory_prefetch_tasks()
             if owns_run:
-                session = self._budget.snapshot() if self._budget is not None else {}
-                run_usage = (
-                    self._budget.delta_since(self._run_budget_baseline)
-                    if self._budget is not None
-                    else {}
-                )
-                unknown = run_usage.get("usage_status") != "complete"
-                self._emit_trace(
-                    "run_finished",
-                    parent_step_id=self._run_step_id,
-                    latency_ms=round((time.monotonic() - started) * 1000, 3),
-                    input_tokens=None if unknown else run_usage.get("input_tokens"),
-                    output_tokens=None if unknown else run_usage.get("output_tokens"),
-                    estimated_cost=run_usage.get("estimated_cost_usd"),
-                    exit_code=1 if (self._aborted or error_type) else 0,
+                self._close_root_run(
+                    started=started,
                     error_type=error_type,
-                    usage_status=run_usage.get("usage_status"),
-                    unknown_usage_count=run_usage.get("unknown_usage_count"),
-                    session_input_tokens=session.get("input_tokens"),
-                    session_output_tokens=session.get("output_tokens"),
-                    session_estimated_cost=session.get("estimated_cost_usd"),
-                    session_usage_status=session.get("usage_status"),
+                    aborted=self._aborted,
                 )
-                TraceRecorder.unbind(tracer_token, parent_token)
         if not self.is_sub_agent:
             print_divider()
             self._auto_save()
@@ -967,9 +1019,13 @@ class Agent:
             return {"ok": False, "error": "no pending online skill extraction window"}
         window = dict(pending)
         window["hint"] = hint
-        await self._run_online_skill_evolution(window, interactive_confirm=True)
-        self._pending_skill_extraction_window = None
-        return {"ok": True}
+
+        async def _work() -> dict[str, Any]:
+            await self._run_online_skill_evolution(window, interactive_confirm=True)
+            self._pending_skill_extraction_window = None
+            return {"ok": True}
+
+        return await self._traced_operation("extract_now", _work)
 
 
     def clear_history(self)->None:
@@ -1030,9 +1086,12 @@ class Agent:
 
     #压缩会话
     async def compact(self)->None:
-        compacted = await self._compact_conversation(trigger="manual")
-        if not compacted:
-            print_info("Nothing to compact yet.")
+        async def _work() -> None:
+            compacted = await self._compact_conversation(trigger="manual")
+            if not compacted:
+                print_info("Nothing to compact yet.")
+
+        await self._traced_operation("compact", _work)
 
 
     #恢复会话信息

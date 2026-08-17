@@ -120,3 +120,11 @@ P2 到此结束，未进入后续阶段。
 | `memory_enabled=false` 仍注入本机 Memory Index；`task_digest` 忽略 `files` | `build_system_prompt(memory_enabled=...)` 关闭时不读本地索引；digest 哈希完整任务对象 |
 
 本轮沙箱：`214 passed`，Ruff 全绿。未进入后续阶段。
+
+## 11. 审查返工（`68fc805` REPL Trace）
+
+`68fc805` 通过上轮三个缺口后，仍有 1 个阻断项：`/skill-eval`、`/compact`、`/extract_now` 不经过 `chat()`，会把 Side Query 写进上一条已 `run_finished` 的 Trace；`skill_evaluated` 走已解绑的 ContextVar 会丢失。
+
+| 缺口 | 修复 |
+|------|------|
+| REPL 命令污染已结束的 chat Trace，评测事件丢失 | 统一 `_traced_operation`：新 `run_id` → bind → 执行 → 结算 → `run_finished` → unbind；结束后清空 Recorder，避免继续追加 |

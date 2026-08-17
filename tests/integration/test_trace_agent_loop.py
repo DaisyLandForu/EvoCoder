@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -419,3 +420,136 @@ async def test_run_finished_reports_this_run_not_session_totals(
     assert (second["input_tokens"], second["output_tokens"]) == (2, 1)
     assert (second["session_input_tokens"], second["session_output_tokens"]) == (4, 2)
     assert second["estimated_cost"] < second["session_estimated_cost"]
+
+
+def _stop_stream(agent: Agent, *, prompt_tokens: int = 2, completion_tokens: int = 1):
+    async def fake_stream() -> dict:
+        agent._emit_text("ok")
+        return {
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "ok", "tool_calls": None},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens},
+        }
+
+    return fake_stream
+
+
+async def _traced_side_query(agent: Agent, text: str = "side") -> None:
+    async def fake_call():
+        return SimpleNamespace(
+            usage=SimpleNamespace(prompt_tokens=5, completion_tokens=1),
+            choices=[SimpleNamespace(message=SimpleNamespace(content=text))],
+        )
+
+    await agent._trace_side_query_call(fake_call, system="sys", user_message=text)
+
+
+@pytest.mark.asyncio
+async def test_repl_commands_do_not_append_to_finished_chat_trace(workspace: Path, tmp_path: Path) -> None:
+    from agents.trace import emit_trace
+
+    trace_dir = tmp_path / "traces"
+    agent = _agent(workspace, trace_dir)
+    agent._call_openai_stream = _stop_stream(agent)
+    await agent.chat("hello")
+    chat_id = agent._run_id
+    chat_path = trace_dir / f"{chat_id}.jsonl"
+    chat_events = read_trace(chat_path)
+    assert chat_events[-1]["event_type"] == "run_finished"
+    assert validate_trace(chat_events) == []
+
+    await _traced_side_query(agent, "stray")
+    assert read_trace(chat_path) == chat_events
+
+    async def eval_work():
+        await _traced_side_query(agent, "eval")
+        emit_trace("skill_evaluated", skill_name="demo", skill_version="0.1.1")
+
+    await agent._traced_operation("skill-eval", eval_work)
+    eval_id = agent._run_id
+    assert eval_id != chat_id
+    assert read_trace(chat_path)[-1]["event_type"] == "run_finished"
+    assert validate_trace(read_trace(chat_path)) == []
+
+    eval_events = read_trace(trace_dir / f"{eval_id}.jsonl")
+    assert validate_trace(eval_events) == []
+    types = [event["event_type"] for event in eval_events]
+    assert types[0] == "run_start"
+    assert types[-1] == "run_finished"
+    assert "model_request" in types
+    assert "skill_evaluated" in types
+    assert types.index("skill_evaluated") < types.index("run_finished")
+
+
+@pytest.mark.asyncio
+async def test_compact_and_extract_now_own_a_valid_trace(workspace: Path, tmp_path: Path) -> None:
+    trace_dir = tmp_path / "traces"
+    agent = _agent(workspace, trace_dir)
+    agent._call_openai_stream = _stop_stream(agent)
+    await agent.chat("hello")
+    chat_id = agent._run_id
+    chat_path = trace_dir / f"{chat_id}.jsonl"
+
+    await agent.compact()
+    compact_id = agent._run_id
+    assert compact_id != chat_id
+    compact_events = read_trace(trace_dir / f"{compact_id}.jsonl")
+    assert validate_trace(compact_events) == []
+    assert compact_events[0]["event_type"] == "run_start"
+    assert compact_events[-1]["event_type"] == "run_finished"
+    assert read_trace(chat_path)[-1]["event_type"] == "run_finished"
+
+    async def fake_evolution(_window, interactive_confirm=False):
+        await _traced_side_query(agent, "extract")
+
+    agent._run_online_skill_evolution = fake_evolution
+    agent._pending_skill_extraction_window = {
+        "messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "done"}]
+    }
+    await agent.extract_now("hint")
+    extract_id = agent._run_id
+    assert extract_id not in {chat_id, compact_id}
+    extract_events = read_trace(trace_dir / f"{extract_id}.jsonl")
+    assert validate_trace(extract_events) == []
+    assert extract_events[-1]["event_type"] == "run_finished"
+    assert any(event["event_type"] == "model_request" for event in extract_events)
+    assert read_trace(chat_path)[-1]["event_type"] == "run_finished"
+
+
+@pytest.mark.asyncio
+async def test_skill_eval_cli_binds_trace_for_skill_evaluated(
+    workspace: Path, tmp_path: Path, skill_workspace: Path
+) -> None:
+    from agents import main as cli
+    from agents.skill_registry import create_candidate
+
+    trace_dir = tmp_path / "traces"
+    agent = _agent(workspace, trace_dir)
+    agent._call_openai_stream = _stop_stream(agent)
+    await agent.chat("hello")
+    chat_id = agent._run_id
+
+    async def fake_query(_system: str, _user: str) -> str:
+        await _traced_side_query(agent, "judge")
+        return json.dumps({"pass": True, "reason": "ok"})
+
+    agent._build_side_query = lambda **_kwargs: fake_query
+    created = create_candidate(
+        skill_name="trace-eval",
+        description="Trace eval",
+        instructions="Be brief.",
+        when_to_use="tests",
+    )
+    summary = await cli._run_skill_eval(agent, "trace-eval", created["version"])
+    eval_id = agent._run_id
+    assert eval_id != chat_id
+    eval_events = read_trace(trace_dir / f"{eval_id}.jsonl")
+    assert validate_trace(eval_events) == []
+    types = [event["event_type"] for event in eval_events]
+    assert types[-1] == "run_finished"
+    assert "failed" in summary or "skill_evaluated" in types or types[0] == "run_start"
+    assert read_trace(trace_dir / f"{chat_id}.jsonl")[-1]["event_type"] == "run_finished"
